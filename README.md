@@ -55,9 +55,4 @@ bash build-portable.sh
 
 ---
 
-## 📄 文档索引
-
-- [docs/UI-STRUCTURE.md](docs/UI-STRUCTURE.md) —— 前端架构与二级菜单结构说明
-- [docs/CONFIG-SCHEMA.md](docs/CONFIG-SCHEMA.md) —— 前后端 19 项 JSON 配置字段契约
-- [docs/BUILD.md](docs/BUILD.md) —— 构建、签名、安装与调试指南
-- [AGENTS.md](AGENTS.md) —— AI 编程助手维护边界与避坑指南
+目前仅在Redmi K60+PixelOS 安卓14上验证，尚且还存在某些bug
