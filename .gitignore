@@ -1,0 +1,9 @@
+# Intermediate build directories
+build/classes/
+build/dex/
+build/gen/
+build/stubs/
+build/app.unsigned.apk
+build/app.aligned.apk
+*.iml
+.DS_Store
