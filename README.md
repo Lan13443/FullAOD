@@ -1,5 +1,7 @@
 # FullAOD —— 类原生 Android 14+ 全屏熄屏显示 LSPosed 模块
 
+> **当前发布版本：`v1.5-opt`**（2026-11-25）｜[下载最新版](https://github.com/Lan13443/FullAOD/releases/latest)
+
 > 为类原生 Android 14+（PixelOS / LineageOS / Evolution X / crDroid 等 AOSP 系 ROM）补齐**锁屏全屏壁纸 AOD（Always-On Display）**体验：熄屏显示主屏幕壁纸 + 保留原生 Pixel AOD 时钟 + iOS 式景深缩放过渡动画 + 智能姿态感应。
 
 ---
@@ -35,7 +37,7 @@
 
 ## 📦 安装与使用
 
-1. 从 [Releases](../../releases) 下载最新 `FullAOD-v1.0.apk`（或使用 `build/FullAOD-v1.0.apk`）并安装到手机。
+1. 从 [Releases](../../releases) 下载最新 `FullAOD-v1.5-opt.apk`（或使用本地构建产物）并安装到手机。
 2. 打开 **LSPosed 管理器** → 启用 **FullAOD** 模块 → 勾选作用域 **`系统界面 (com.android.systemui)`**。
 3. 打开一次 **FullAOD** 应用（自动完成 `WRITE_SECURE_SETTINGS` 权限自愈并同步 19 项配置至 `Settings.Secure`）。
 4. 重启一次 SystemUI（`su -c "killall com.android.systemui"`）或重启手机即可生效；后续调整任何参数均在**下次熄屏时自动生效**，无需再次重启。
@@ -50,7 +52,7 @@
 export ANDROID_JAR=$ANDROID_HOME/platforms/android-34/android.jar
 export D8_JAR=$ANDROID_HOME/build-tools/34.0.0/lib/d8.jar   # 若 PATH 中有 d8 可留空
 bash build-portable.sh
-# 产出：build/FullAOD-v1.0.apk
+# 产出：build/FullAOD-v1.0.apk（名称由 build-portable.sh 的 APK_NAME 决定）
 ```
 
 ---
