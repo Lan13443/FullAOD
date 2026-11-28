@@ -8,9 +8,14 @@ import android.content.BroadcastReceiver;
 import android.content.Context;
 import android.content.Intent;
 import android.content.IntentFilter;
+import android.database.ContentObserver;
 import android.graphics.Bitmap;
+import android.graphics.BitmapFactory;
 import android.graphics.Canvas;
+import android.graphics.Color;
+import android.graphics.Rect;
 import android.graphics.drawable.BitmapDrawable;
+import android.graphics.drawable.ColorDrawable;
 import android.graphics.drawable.Drawable;
 import android.hardware.Sensor;
 import android.hardware.SensorEvent;
@@ -19,62 +24,85 @@ import android.hardware.SensorManager;
 import android.hardware.TriggerEvent;
 import android.hardware.TriggerEventListener;
 import android.net.Uri;
+import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
+import android.os.HandlerThread;
 import android.os.Looper;
+import android.os.ParcelFileDescriptor;
 import android.os.PowerManager;
+import android.os.Process;
 import android.os.SystemClock;
+import android.provider.Settings;
 import android.view.View;
 import android.view.ViewGroup;
 import android.view.animation.PathInterpolator;
 import android.widget.FrameLayout;
-
-import org.json.JSONObject;
-
+import de.robv.android.xposed.XposedBridge;
+import de.robv.android.xposed.XposedHelpers;
 import java.io.File;
 import java.io.FileOutputStream;
 import java.lang.reflect.Field;
+import java.lang.reflect.Method;
 import java.text.SimpleDateFormat;
+import java.util.ArrayList;
 import java.util.Calendar;
 import java.util.Date;
+import java.util.List;
+import java.util.Locale;
 import java.util.Random;
+import org.json.JSONObject;
 
-import de.robv.android.xposed.XposedBridge;
-import de.robv.android.xposed.XposedHelpers;
-
-/**
- * 运行在 com.android.systemui 进程内。
- */
-public final class AodController {
+public class AodController {
 
     public static final String TAG = "FullAOD";
     private static final String CONFIG_URI = "content://com.operit.fullaod.config";
+    private static final String SECURE_CFG_KEY = "fullaod_cfg";
+    private static final int SENSOR_TYPE_TILT_DETECTOR = 22;
+    private static final int SENSOR_TYPE_PICK_UP_GESTURE = 25;
+    private static final long SHIFT_INTERVAL_MS = 15000L;
+    private static final long BOUNCER_TICK_MS = 250L;
+    private static final long SCRIM_KEEPER_INTERVAL_MS = 120L;
+    private static final int SCRIM_KEEPER_MAX_TICKS = 10;
+    private static final long BURST_WAKELOCK_MAX_MS = 3000L;
+    private static final long LOG_MAX_BYTES = 128L * 1024L;
+    private static final int LOG_KEEP_TAIL_BYTES = 32 * 1024;
 
     private static AodController sInst;
 
     public static synchronized AodController get() {
-        if (sInst == null) sInst = new AodController();
+        if (sInst == null) {
+            sInst = new AodController();
+        }
         return sInst;
     }
 
     private final Handler mH = new Handler(Looper.getMainLooper());
-    private final Random mRand = new Random();
+    private HandlerThread mBgThread;
+    private Handler mBgH;
 
     private Context mCtx;
-    private ViewGroup mParent;
+    private ViewGroup mRoot;
     private WallpaperAodView mView;
     private Bitmap mBitmap;
+    private volatile boolean mWpLoading = false;
+    private long mLastWpLoadTs = 0L;
+
+    private Object mDozeMachine;
     private Object mScrimController;
+    private Object mBrightnessForwarder;
+    private Object mDozeService;
+    private int mLastRawBrightnessInt = -1;
+    private int mLastAppliedBrightnessInt = -1;
+    private int mLastLogRaw = -1;
+    private int mLastLogOut = -1;
+    private boolean mPushingBrightness = false;
+    private boolean mInApplyState = false;
+    private boolean mScrimTouched = false;
+    private float mSavedBehindViewAlpha = -1f;
+    private float mSavedFrontViewAlpha = -1f;
 
-    private boolean mAod = false;
-    private boolean mIntervene = false;
-    private boolean mInApply = false;
-    private boolean mCfgLoaded = false;
-    private long mLastCfg = 0L;
-    private String mLastCfgJson = null;
-    private ValueAnimator mAnim;
-
-    // 配置（默认值与 Prefs 保持一致）
+    // Config fields (preserving all 20 FullAOD v1.4 JSON keys)
     private boolean cfgEnabled = true;
     private float cfgMask = 0.65f;
     private float cfgBright = 2.0f;
@@ -85,7 +113,10 @@ public final class AodController {
     private int cfgAnimIn = 550;
     private int cfgAnimOut = 350;
     private float cfgScale = 1.03f;
+    private float mBaseWallpaperScale = 1.0f;
     private boolean cfgTop = false;
+    private boolean cfgShade = false;
+    private float cfgShadeMask = 0.8f;
     private boolean cfgTimeoutOn = false;
     private int cfgTimeoutMin = 30;
     private int cfgTimeoutMode = 0;
@@ -93,482 +124,1333 @@ public final class AodController {
     private boolean cfgNightSmart = false;
     private boolean cfgFlipOff = true;
     private boolean cfgLiftWake = true;
-    private boolean mNightActive = false;
-    private int mNightSessDay = -999;
-    private boolean mNightSessEnded = false;
-    private long mAodEnterTs = 0L;
-    private boolean mTimedOut = false;
-    private Object mDozeMachine = null;
-    private boolean cfgShade = false;
-    private float cfgShadeMask = 0.80f;
-    private boolean mShadeMode = false;
 
-    // 姿态检测（反扣关闭所有 AOD / 拿起自动亮屏）与壁纸更新监听
-    private boolean mWallpaperReceiverRegistered = false;
-    private boolean mFaceDownPaused = false;
-    private boolean mSensorRegistered = false;
-    private boolean mPickupTriggerRegistered = false;
-    private Sensor mPickupSensor = null;
-    private PowerManager.WakeLock mFaceDownWakeLock = null;
-    private boolean mGravityInit = false;
-    private float mGx = 0f, mGy = 0f, mGz = 9.8f;
-    private boolean mBaseGravityInit = false;
-    private float mBaseGx = 0f, mBaseGy = 0f, mBaseGz = 9.8f;
-    private boolean mProximityNear = false;
-    private long mFaceDownSince = 0L;
-    private long mFaceUpSince = 0L;
-    private long mSensorStartElapsed = 0L;
-    private long mLastMotionTs = 0L;
-    private long mLastLiftWakeTs = 0L;
-    private boolean mScrimCancelled = false;
-    private boolean mScrimRestored = false;
-    private boolean mScrimApplied = false;
-    private boolean mRootDimmed = false;
+    private boolean mCfgLoaded = false;
+    private long mLastCfgReadTs = 0L;
+    private boolean mCfgObserverRegistered = false;
+    private boolean mReceiversRegistered = false;
+
+    // State fields
+    private boolean mAod = false;
+    private boolean mDozing = false;
+    private String mDozeState = "UNINITIALIZED";
+    private long mAodEnterTs = 0L;
+    private boolean mAodTimedOut = false;
+    private boolean mNightActive = false;
+    private int mNightClearedSession = -1;
     private boolean mBouncerBg = false;
     private long mBouncerLast = 0L;
-    private View mClockView = null;
+    private boolean mClocksHidden = false;
+    private boolean mShowingTarget = false;
+    private float mTargetAlpha = 0f;
+    private ValueAnimator mAnim;
+
+    // Clocks & opaque backgrounds saved for Bouncer/Shade
+    private final ArrayList<View> mClocks = new ArrayList<>();
+    private final ArrayList<Float> mClocksAlpha = new ArrayList<>();
+    private final ArrayList<View> mClearedViews = new ArrayList<>();
+    private final ArrayList<Drawable> mClearedBgs = new ArrayList<>();
+    private View mClockView;
     private float mClockOldAlpha = 1f;
-    private final java.util.ArrayList<View> mClocks = new java.util.ArrayList<View>();
-    private final java.util.ArrayList<Float> mClocksAlpha = new java.util.ArrayList<Float>();
-    private android.graphics.drawable.Drawable mRootDimBg = null;
-    private int mScrimHeal = 0;
 
-    private final java.util.ArrayList<View> mClearedViews = new java.util.ArrayList<View>();
-    private final java.util.ArrayList<android.graphics.drawable.Drawable> mClearedBgs =
-            new java.util.ArrayList<android.graphics.drawable.Drawable>();
+    // Pixel shift
+    private final Random mRand = new Random();
+    private long mLastShiftTs = 0L;
 
-    private final Runnable mShiftTask = new Runnable() {
-        @Override
-        public void run() {
-            if (!mAod || mView == null) return;
-            float d = cfgShift ? 3f : 0f;
-            float x = d == 0f ? 0f : (mRand.nextFloat() * 2f - 1f) * d;
-            float y = d == 0f ? 0f : (mRand.nextFloat() * 2f - 1f) * d;
-            mView.setPixelShift(x, y);
-            mH.postDelayed(this, 90000L);
-        }
-    };
+    // Tick & ScrimKeeper
+    private boolean mTickRunning = false;
+    private boolean mScrimKeeperRunning = false;
+    private int mScrimKeeperTicks = 0;
+
+    // Posture sensors
+    private SensorManager mSm;
+    private Sensor mProxSensor;
+    private Sensor mAccelSensor;
+    private Sensor mTiltSensor;
+    private Sensor mPickupSensor;
+    private boolean mSensorsProbed = false;
+    private boolean mProxRegistered = false;
+    private boolean mTiltRegistered = false;
+    private boolean mAccelRegistered = false;
+    private boolean mPickupTriggerRegistered = false;
+    private boolean mInitialBurstDoneForOff = false;
+
+    private boolean mProximityNear = false;
+    private boolean mFaceDownPaused = false;
+    private long mFaceDownSince = 0L;
+    private long mFaceUpSince = 0L;
+    private boolean mGravityInit = false;
+    private float mGx = 0f;
+    private float mGy = 0f;
+    private float mGz = 9.8f;
+    private boolean mBaseGravityInit = false;
+    private float mBaseGx = 0f;
+    private float mBaseGy = 0f;
+    private float mBaseGz = 9.8f;
+    private long mSensorStartElapsed = 0L;
+    private long mAccelStopAtElapsed = 0L;
+    private long mLastMotionTs = 0L;
+    private long mLastLiftWakeTs = 0L;
+
+    private PowerManager mPm;
+    private PowerManager.WakeLock mFaceDownWakeLock;
+    private Method mApplyStateMethod;
+    private boolean mApplyStateMethodResolved = false;
+    private Method mWakeUpMethod;
+    private int mWakeUpArgCount = 0;
+
+    private File mLogFile;
+    private final Object mLogLock = new Object();
 
     private AodController() {
+        ensureBgThread();
     }
 
-    public void setContext(Context c) {
-        if (c != null && mCtx == null) {
-            mCtx = c;
-            log("context set");
-            registerWallpaperReceiver();
+    private synchronized void ensureBgThread() {
+        if (mBgThread == null || !mBgThread.isAlive()) {
+            mBgThread = new HandlerThread("FullAOD-Worker", Process.THREAD_PRIORITY_BACKGROUND);
+            mBgThread.start();
+            mBgH = new Handler(mBgThread.getLooper());
         }
     }
 
-    private void registerWallpaperReceiver() {
-        if (mWallpaperReceiverRegistered || mCtx == null) return;
+    public void log(final String msg) {
+        if (msg == null) return;
+        XposedBridge.log(TAG + ": " + msg);
+        ensureBgThread();
+        final long nowMs = System.currentTimeMillis();
+        mBgH.post(() -> writeLogAsync(nowMs, msg));
+    }
+
+    private void writeLogAsync(long nowMs, String msg) {
+        File lf = mLogFile;
+        if (lf == null && mCtx != null) {
+            try {
+                File dir = null;
+                if (Build.VERSION.SDK_INT >= 24) {
+                    Context deCtx = mCtx.createDeviceProtectedStorageContext();
+                    if (deCtx != null) dir = deCtx.getFilesDir();
+                }
+                if (dir == null) dir = mCtx.getFilesDir();
+                if (dir != null) {
+                    lf = new File(dir, "fullaod.log");
+                    mLogFile = lf;
+                }
+            } catch (Throwable ignored) {
+            }
+        }
+        if (lf == null) return;
+
+        synchronized (mLogLock) {
+            try {
+                if (lf.exists() && lf.length() > LOG_MAX_BYTES) {
+                    rotateLogFile(lf);
+                }
+                String ts = new SimpleDateFormat("MM-dd HH:mm:ss.SSS", Locale.US).format(new Date(nowMs));
+                String line = ts + " " + msg + "\n";
+                try (FileOutputStream fos = new FileOutputStream(lf, true)) {
+                    fos.write(line.getBytes("UTF-8"));
+                }
+            } catch (Throwable ignored) {
+            }
+        }
+    }
+
+    private static void rotateLogFile(File lf) {
         try {
-            IntentFilter filter = new IntentFilter(Intent.ACTION_WALLPAPER_CHANGED);
-            mCtx.registerReceiver(new BroadcastReceiver() {
+            byte[] data = java.nio.file.Files.readAllBytes(lf.toPath());
+            int start = Math.max(0, data.length - LOG_KEEP_TAIL_BYTES);
+            while (start < data.length && data[start] != '\n') start++;
+            if (start < data.length) start++;
+            try (FileOutputStream fos = new FileOutputStream(lf, false)) {
+                fos.write("--- log rotated ---\n".getBytes("UTF-8"));
+                fos.write(data, start, data.length - start);
+            }
+        } catch (Throwable ignored) {
+            try {
+                new FileOutputStream(lf, false).close();
+            } catch (Throwable ignored2) {
+            }
+        }
+    }
+
+    public void setContext(Context ctx) {
+        if (ctx == null) return;
+        Context app = ctx.getApplicationContext();
+        mCtx = app != null ? app : ctx;
+        if (mPm == null) {
+            mPm = (PowerManager) mCtx.getSystemService(Context.POWER_SERVICE);
+        }
+        if (mSm == null) {
+            mSm = (SensorManager) mCtx.getSystemService(Context.SENSOR_SERVICE);
+        }
+        registerConfigObserver();
+        registerReceivers();
+    }
+
+    public void setDozeMachine(Object dm) {
+        if (dm != null) {
+            mDozeMachine = dm;
+        }
+    }
+
+    public void attachShadeView(final ViewGroup root, final Context ctx) {
+        if (root == null) return;
+        runOnMain(() -> attachShadeViewMain(root, ctx));
+    }
+
+    private void attachShadeViewMain(ViewGroup root, Context ctx) {
+        Context c = ctx != null ? ctx : root.getContext();
+        setContext(c);
+        if (mRoot == root && mView != null && mView.getParent() == root) {
+            return;
+        }
+
+        if (mView != null && mView.getParent() instanceof ViewGroup) {
+            ((ViewGroup) mView.getParent()).removeView(mView);
+        }
+        mRoot = root;
+        loadBaseWallpaperScale();
+        root.post(this::ensureLockscreenCenterOffset);
+        if (mView == null) {
+            mView = new WallpaperAodView(mCtx);
+            mView.setAlpha(0f);
+            mView.setVisibility(View.GONE);
+        }
+        if (mBitmap != null && !mBitmap.isRecycled()) {
+            mView.setBitmap(mBitmap);
+        }
+
+        ViewGroup.LayoutParams lp = new ViewGroup.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.MATCH_PARENT);
+        root.addView(mView, 0, lp);
+        placeBelowPanel();
+        refreshConfig(true);
+        loadWallpaper(0);
+        updatePostureSensors();
+        log("attachShadeView ok root=" + root.getClass().getSimpleName() + " children=" + root.getChildCount());
+    }
+
+    private void registerConfigObserver() {
+        if (mCfgObserverRegistered || mCtx == null) return;
+        mCfgObserverRegistered = true;
+        try {
+            ContentObserver obs = new ContentObserver(mH) {
+                @Override
+                public void onChange(boolean selfChange) {
+                    onConfigUpdated();
+                }
+            };
+            Uri secureUri = Settings.Secure.getUriFor(SECURE_CFG_KEY);
+            if (secureUri != null) {
+                mCtx.getContentResolver().registerContentObserver(secureUri, false, obs);
+            }
+            mCtx.getContentResolver().registerContentObserver(Uri.parse(CONFIG_URI), true, obs);
+        } catch (Throwable t) {
+            log("registerConfigObserver err: " + t);
+        }
+    }
+
+    private void registerReceivers() {
+        if (mReceiversRegistered || mCtx == null) return;
+        mReceiversRegistered = true;
+        try {
+            IntentFilter f = new IntentFilter();
+            f.addAction(Intent.ACTION_WALLPAPER_CHANGED);
+            f.addAction(Intent.ACTION_SCREEN_ON);
+            f.addAction(Intent.ACTION_SCREEN_OFF);
+            f.addAction(Intent.ACTION_USER_PRESENT);
+            BroadcastReceiver rx = new BroadcastReceiver() {
                 @Override
                 public void onReceive(Context context, Intent intent) {
-                    log("wallpaper changed broadcast -> reload");
-                    loadWallpaper(2);
+                    if (intent == null) return;
+                    final String act = intent.getAction();
+                    if (Intent.ACTION_WALLPAPER_CHANGED.equals(act)) {
+                        log("ACTION_WALLPAPER_CHANGED received");
+                        loadBaseWallpaperScale();
+                        ensureLockscreenCenterOffset();
+                        mH.postDelayed(AodController.this::ensureLockscreenCenterOffset, 200L);
+                        loadWallpaper(1);
+                    } else if (Intent.ACTION_SCREEN_OFF.equals(act)) {
+                        onScreenOffEvent();
+                    } else if (Intent.ACTION_SCREEN_ON.equals(act)) {
+                        ensureLockscreenCenterOffset();
+                        onScreenOnEvent();
+                    } else if (Intent.ACTION_USER_PRESENT.equals(act)) {
+                        onUserPresentEvent();
+                    }
                 }
-            }, filter);
-            mWallpaperReceiverRegistered = true;
-        } catch (Throwable t) {
-            log("registerWallpaperReceiver fail: " + t);
-        }
-    }
-
-    /* ---------------- 入口：挂载视图 ---------------- */
-
-    public void attachShadeView(ViewGroup root, Context ctx) {
-        if (root == null) return;
-        try {
-            setContext(ctx);
-            mParent = root;
-            if (mView == null) {
-                mView = new WallpaperAodView(ctx);
-                mView.setAlpha(0f);
-                mView.setVisibility(View.GONE);
-                mView.setMaskAlpha(cfgMask);
-            } else if (mView.getParent() == root) {
-                log("attach: already attached, children=" + root.getChildCount());
-                ensureWallpaperLoaded();
-                return;
-            } else if (mView.getParent() instanceof ViewGroup) {
+            };
+            if (Build.VERSION.SDK_INT >= 33) {
                 try {
-                    ((ViewGroup) mView.getParent()).removeView(mView);
+                    mCtx.registerReceiver(rx, f, Context.RECEIVER_EXPORTED);
+                    return;
                 } catch (Throwable ignored) {
                 }
             }
-
-            FrameLayout.LayoutParams lp = new FrameLayout.LayoutParams(
-                    ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT);
-            try {
-                root.addView(mView, 0, lp);
-            } catch (Throwable t) {
-                log("attach index0 fail: " + t);
-                root.addView(mView, lp);
-            }
-            log("attach ok: inserted at index 0, children=" + root.getChildCount()
-                    + " root=" + root.getClass().getName());
-            ensureWallpaperLoaded();
-            refreshConfig();
-            startTick();
+            mCtx.registerReceiver(rx, f);
         } catch (Throwable t) {
-            log("attachShadeView fail: " + t);
+            log("registerReceivers err: " + t);
         }
     }
 
-    private void ensureWallpaperLoaded() {
-        if (mBitmap != null) return;
-        mH.postDelayed(new Runnable() {
-            @Override
-            public void run() {
-                loadWallpaper(3);
+    private void onConfigUpdated() {
+        loadBaseWallpaperScale();
+        refreshConfig(true);
+        updateNightActive();
+        if (mAod) {
+            applyAod(true);
+        } else if (mBouncerBg) {
+            if (!cfgEnabled) {
+                hideBouncerBg();
+            } else if (mView != null) {
+                applyViewScale(getTargetWallpaperScale());
+                boolean isShade = cfgShade && isShadeOverlayActive(readScrimState(mScrimController));
+                mView.setMaskAlpha(isShade ? cfgShadeMask : cfgMask);
             }
-        }, 1500L);
-    }
-
-    /* ---------------- 壁纸加载 ---------------- */
-
-    private void loadWallpaper(final int retries) {
-        final Context c = mCtx;
-        if (c == null) {
-            log("loadWallpaper: no context");
-            return;
         }
-        new Thread(new Runnable() {
-            @Override
-            public void run() {
-                try {
-                    WallpaperManager wm = WallpaperManager.getInstance(c);
-                    Drawable d = wm.getDrawable();
-                    Bitmap src = null;
-                    if (d instanceof BitmapDrawable) {
-                        src = ((BitmapDrawable) d).getBitmap();
-                    } else if (d != null) {
-                        int w = Math.max(1, c.getResources().getDisplayMetrics().widthPixels);
-                        int h = Math.max(1, c.getResources().getDisplayMetrics().heightPixels);
-                        Bitmap tmp = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888);
-                        Canvas cv = new Canvas(tmp);
-                        d.setBounds(0, 0, w, h);
-                        d.draw(cv);
-                        src = tmp;
-                    }
-                    if (src == null) throw new IllegalStateException("wallpaper drawable null");
-
-                    int tw = Math.min(1080, src.getWidth());
-                    if (tw < 1) tw = 1;
-                    int th = (int) ((float) tw * src.getHeight() / Math.max(1, src.getWidth()));
-                    if (th < 1) th = 1;
-                    Bitmap scaled = Bitmap.createScaledBitmap(src, tw, th, true);
-                    Bitmap out = scaled;
-                    try {
-                        out = scaled.copy(Bitmap.Config.RGB_565, false);
-                    } catch (Throwable ignored) {
-                    }
-                    final Bitmap fout = out;
-                    mBitmap = fout;
-                    mH.post(new Runnable() {
-                        @Override
-                        public void run() {
-                            if (mView != null) {
-                                mView.setBitmap(fout);
-                                mView.setMaskAlpha(cfgMask);
-                            }
-                            log("wallpaper loaded " + fout.getWidth() + "x" + fout.getHeight()
-                                    + " " + fout.getConfig());
-                        }
-                    });
-                } catch (final Throwable t) {
-                    log("wallpaper load fail(" + retries + "): " + t);
-                    if (retries > 0) {
-                        mH.postDelayed(new Runnable() {
-                            @Override
-                            public void run() {
-                                loadWallpaper(retries - 1);
-                            }
-                        }, 3000L);
-                    }
-                }
-            }
-        }).start();
+        updatePostureSensors();
     }
-
-    /* ---------------- 配置 ---------------- */
 
     public void refreshConfig() {
-        long now = SystemClock.uptimeMillis();
-        if (mCfgLoaded && now - mLastCfg < 3000L) return;
-        mLastCfg = now;
-        Context c = mCtx;
-        if (c == null) return;
-        String json = null;
-        try {
-            String s = android.provider.Settings.Secure.getString(
-                    c.getContentResolver(), "fullaod_cfg");
-            if (s != null && s.length() > 2) {
-                json = s;
-            }
-        } catch (Throwable t2) {
-            log("cfg settings fail: " + t2);
+        refreshConfig(false);
+    }
+
+    private void refreshConfig(boolean force) {
+        if (mCtx == null) return;
+        long now = SystemClock.elapsedRealtime();
+        if (!force && mCfgLoaded && (now - mLastCfgReadTs) < 500L) {
+            return;
         }
-        if (json == null || json.length() <= 2) {
+        mLastCfgReadTs = now;
+
+        String jsonStr = null;
+        try {
+            jsonStr = Settings.Secure.getString(mCtx.getContentResolver(), SECURE_CFG_KEY);
+        } catch (Throwable ignored) {
+        }
+        if (jsonStr == null || jsonStr.trim().isEmpty()) {
             try {
-                Bundle b = c.getContentResolver().call(Uri.parse(CONFIG_URI), "get", null, null);
-                if (b != null) json = b.getString("json");
-            } catch (Throwable t) {
-                log("cfg provider fail: " + t);
+                Bundle res = mCtx.getContentResolver().call(Uri.parse(CONFIG_URI), "get", null, null);
+                if (res != null) {
+                    jsonStr = res.getString("json");
+                }
+            } catch (Throwable ignored) {
             }
         }
+        if (jsonStr == null || jsonStr.trim().isEmpty()) {
+            mCfgLoaded = true;
+            return;
+        }
+
         try {
-            if (json == null || json.length() <= 2) return;
-            if (json.equals(mLastCfgJson)) return;
-            mLastCfgJson = json;
-            log("cfg updated -> " + json);
-            JSONObject o = new JSONObject(json);
+            JSONObject o = new JSONObject(jsonStr);
             cfgEnabled = o.optBoolean("enabled", true);
-            cfgMask = (float) o.optDouble("mask", 0.65);
-            cfgBright = (float) o.optDouble("bright", 2.0);
+            cfgMask = clampFloat((float) o.optDouble("mask", 0.65), 0f, 1f);
+            cfgBright = clampFloat((float) o.optDouble("bright", 2.0), 0.1f, 5.0f);
             cfgShift = o.optBoolean("shift", true);
             cfgNight = o.optBoolean("night", true);
-            cfgNS = o.optInt("nightStart", 23);
-            cfgNE = o.optInt("nightEnd", 7);
-            cfgAnimIn = o.optInt("animIn", 550);
-            cfgAnimOut = o.optInt("animOut", 350);
-            cfgScale = (float) o.optDouble("scale", 1.03);
+            cfgNS = clampInt(o.optInt("nightStart", 23), 0, 23);
+            cfgNE = clampInt(o.optInt("nightEnd", 7), 0, 23);
+            cfgAnimIn = clampInt(o.optInt("animIn", 550), 0, 5000);
+            cfgAnimOut = clampInt(o.optInt("animOut", 350), 0, 5000);
+            cfgScale = clampFloat((float) o.optDouble("scale", 1.03), 0.5f, 2.0f);
             cfgTop = o.optBoolean("top", false);
             cfgShade = o.optBoolean("shade", false);
-            cfgShadeMask = (float) o.optDouble("shadeMask", 0.80);
+            cfgShadeMask = clampFloat((float) o.optDouble("shadeMask", 0.8), 0f, 1f);
             cfgTimeoutOn = o.optBoolean("aodTimeoutOn", false);
-            cfgTimeoutMin = o.optInt("aodTimeoutMin", 30);
-            cfgTimeoutMode = o.optInt("aodTimeoutMode", 0);
-            cfgNightMode = o.optInt("nightMode", 0);
+            cfgTimeoutMin = clampInt(o.optInt("aodTimeoutMin", 30), 1, 1440);
+            cfgTimeoutMode = clampInt(o.optInt("aodTimeoutMode", 0), 0, 1);
+            cfgNightMode = clampInt(o.optInt("nightMode", 0), 0, 1);
             cfgNightSmart = o.optBoolean("nightSmart", false);
             cfgFlipOff = o.optBoolean("flipOff", true);
             cfgLiftWake = o.optBoolean("liftWake", true);
             mCfgLoaded = true;
-            if (mView != null) mView.setMaskAlpha(cfgMask);
-            if (!cfgFlipOff && mFaceDownPaused) {
-                exitFaceDownAodResume();
-            }
-            updatePostureSensors();
         } catch (Throwable t) {
-            log("cfg read fail: " + t);
+            log("parse cfg err: " + t);
         }
     }
 
-    /** 夜间会话编号：跨零点时段凌晨归属前一晚，非跨零点时段归属当天，支持跨年 */
-    private int nightSessionKey(Calendar cal) {
-        int h = cal.get(Calendar.HOUR_OF_DAY);
-        int yearDay = cal.get(Calendar.YEAR) * 400 + cal.get(Calendar.DAY_OF_YEAR);
-        if (cfgNS > cfgNE) {
-            return (h >= cfgNS) ? yearDay : yearDay - 1;
-        }
-        return yearDay;
+    public void setBrightnessForwarder(Object fwd) {
+        if (fwd != null) mBrightnessForwarder = fwd;
     }
 
-    /**
-     * 维护"当前是否处于夜间退化"。
-     * 智能模式：在夜间时间窗内进入，直到"次日 05:00 后第一次亮屏并解锁"才结束；
-     * 结束标记按会话记录，当天不会再重新进入。
-     */
-    private void updateNightActive() {
-        if (!cfgEnabled || !cfgNight) {
-            mNightActive = false;
-            return;
+    public void setDozeService(Object svc) {
+        if (svc != null) mDozeService = svc;
+    }
+
+    private boolean isAodBrightnessEligible() {
+        if (!cfgEnabled || mAodTimedOut || mFaceDownPaused) {
+            return false;
         }
-        if (!cfgNightSmart && mNightSessEnded) {
-            mNightSessEnded = false;
+        updateNightActive();
+        if (mNightActive) {
+            return false;
         }
-        Calendar cal = Calendar.getInstance();
-        int h = cal.get(Calendar.HOUR_OF_DAY);
-        int key = nightSessionKey(cal);
-        if (key != mNightSessDay) {
-            mNightSessDay = key;
-            mNightSessEnded = false;
+        if (mAod) {
+            return true;
         }
-        if (!isNight() || mNightSessEnded) {
-            mNightActive = false;
-            return;
-        }
-        if (!mNightActive) {
-            mNightActive = true;
-            log("night: active smart=" + cfgNightSmart + " key=" + key);
-        }
-        if (cfgNightSmart) {
-            boolean unlocked = isScreenOn()
-                    && readScrimState().indexOf("UNLOCKED") >= 0;
-            if (h >= 5 && unlocked) {
-                mNightActive = false;
-                mNightSessEnded = true;
-                log("night: ended by first unlock at " + h + "h");
+        if (mDozeMachine != null) {
+            try {
+                Object st = XposedHelpers.callMethod(mDozeMachine, "getState");
+                String s = String.valueOf(st);
+                if ("DOZE_AOD".equals(s) || "DOZE_AOD_DOCKED".equals(s) || "DOZE_AOD_PAUSING".equals(s)) {
+                    return true;
+                }
+            } catch (Throwable ignored) {
             }
         }
+        return false;
+    }
+
+    public int onBrightnessInt(int orig) {
+        return onBrightnessInt(orig, false);
+    }
+
+    public int onBrightnessInt(int orig, boolean fromDream) {
+        if (mPushingBrightness || orig <= 0) {
+            return orig;
+        }
+        if (fromDream && mBrightnessForwarder != null) {
+            return orig;
+        }
+        mLastRawBrightnessInt = orig;
+        int out = (isAodBrightnessEligible() && Math.abs(cfgBright - 1.0f) >= 0.01f)
+                ? clampInt(Math.round(orig * cfgBright), 1, 255)
+                : orig;
+        mLastAppliedBrightnessInt = out;
+        if (orig != mLastLogRaw || out != mLastLogOut) {
+            mLastLogRaw = orig;
+            mLastLogOut = out;
+            log("brightness: raw=" + orig + " -> out=" + out + " (cfgBright=" + cfgBright + ")");
+        }
+        return out;
+    }
+
+    private void syncDozeBrightness(boolean scaled) {
+        if (mLastRawBrightnessInt <= 0) return;
+        int target = (scaled && Math.abs(cfgBright - 1.0f) >= 0.01f)
+                ? clampInt(Math.round(mLastRawBrightnessInt * cfgBright), 1, 255)
+                : mLastRawBrightnessInt;
+        if (target == mLastAppliedBrightnessInt) return;
+        Object host = mBrightnessForwarder != null ? mBrightnessForwarder : mDozeService;
+        if (host == null) return;
+        mPushingBrightness = true;
+        try {
+            XposedHelpers.callMethod(host, "setDozeScreenBrightness", target);
+            mLastAppliedBrightnessInt = target;
+            log("brightness sync: raw=" + mLastRawBrightnessInt + " -> target=" + target);
+        } catch (Throwable t) {
+            log("brightness sync err: " + t);
+        } finally {
+            mPushingBrightness = false;
+        }
+    }
+
+    public float onBrightness(float orig) {
+        return onBrightness(orig, false);
+    }
+
+    public float onBrightness(float orig, boolean fromDream) {
+        if (mPushingBrightness || Float.isNaN(orig) || orig <= 0f) {
+            return orig;
+        }
+        if (fromDream && mBrightnessForwarder != null) {
+            return orig;
+        }
+        if (!isAodBrightnessEligible()) {
+            return orig;
+        }
+        if (Math.abs(cfgBright - 1.0f) < 0.01f) {
+            return orig;
+        }
+        if (orig <= 1.0f) {
+            return clampFloat(orig * cfgBright, 0.004f, 1.0f);
+        }
+        return clampFloat(orig * cfgBright, 1.0f, 255.0f);
+    }
+
+    public void onDozeState(final String rawState) {
+        if (rawState == null) return;
+        final String s = rawState.trim();
+        runOnMain(() -> handleDozeStateMain(s));
+    }
+
+    private void handleDozeStateMain(String s) {
+        refreshConfig(false);
+        String prev = mDozeState;
+        mDozeState = s;
+
+        boolean wasAod = mAod;
+        // Treat DOZE_AOD / DOZE_AOD_DOCKED / transient DOZE_AOD_PAUSING as visible AOD;
+        // DOZE_AOD_PAUSED / DOZE / FINISH turn AOD wallpaper off.
+        boolean isAod = "DOZE_AOD".equals(s) || "DOZE_AOD_DOCKED".equals(s) || "DOZE_AOD_PAUSING".equals(s);
+        boolean isDozing = isAod
+                || "DOZE".equals(s)
+                || "DOZE_AOD_PAUSED".equals(s)
+                || "DOZE_REQUEST_PULSE".equals(s)
+                || "DOZE_PULSING".equals(s)
+                || "DOZE_PULSING_BRIGHT".equals(s)
+                || "DOZE_PULSE_DONE".equals(s);
+
+        mDozing = isDozing;
+        mAod = isAod;
+
+        if ("INITIALIZED".equals(s) || "FINISH".equals(s) || "UNINITIALIZED".equals(s)) {
+            mAodTimedOut = false;
+            mFaceDownPaused = false;
+            mFaceDownSince = 0L;
+            mFaceUpSince = 0L;
+            mInitialBurstDoneForOff = false;
+            if ("FINISH".equals(s) || "UNINITIALIZED".equals(s)) {
+                mLastRawBrightnessInt = -1;
+                mLastAppliedBrightnessInt = -1;
+                mLastLogRaw = -1;
+                mLastLogOut = -1;
+            }
+        }
+
+        if (!wasAod && isAod) {
+            mAodEnterTs = SystemClock.elapsedRealtime();
+            mAodTimedOut = false;
+            if (!mFaceDownPaused) {
+                ensureWallpaperLoaded();
+            }
+        }
+
+        if (!s.equals(prev)) {
+            log("dozeState: " + prev + " -> " + s
+                    + " faceDownPaused=" + mFaceDownPaused
+                    + " night=" + mNightActive
+                    + " timeout=" + mAodTimedOut);
+        }
+
+        updateNightActive();
+        checkAodTimeout();
+        if (wasAod && isAod) {
+            // Transient transitions such as DOZE_AOD <-> DOZE_AOD_PAUSING should not re-trigger zoom/diag
+            if (isWallpaperAodVisible()) {
+                applyScrimNow();
+            } else {
+                applyAod(false);
+            }
+        } else {
+            applyAod(false);
+        }
+        updatePostureSensors();
+    }
+
+    private void onScreenOffEvent() {
+        mInitialBurstDoneForOff = false;
+        updatePostureSensors();
+    }
+
+    private void onScreenOnEvent() {
+        mFaceDownPaused = false;
+        mFaceDownSince = 0L;
+        mFaceUpSince = 0L;
+        mInitialBurstDoneForOff = false;
+        updatePostureSensors();
+    }
+
+    private void onUserPresentEvent() {
+        mFaceDownPaused = false;
+        mFaceDownSince = 0L;
+        mFaceUpSince = 0L;
+        mAodTimedOut = false;
+        mInitialBurstDoneForOff = false;
+
+        if (cfgNight && cfgNightSmart && isNight()) {
+            Calendar cal = Calendar.getInstance();
+            if (isInMorningTail(cal, cfgNS, cfgNE)) {
+                int sess = nightSessionKey(cal);
+                if (mNightClearedSession != sess) {
+                    mNightClearedSession = sess;
+                    log("nightSmart cleared on user unlock session=" + sess
+                            + " hour=" + cal.get(Calendar.HOUR_OF_DAY));
+                }
+            }
+        }
+        hideBouncerBg();
+        updatePostureSensors();
+        stopTick();
+    }
+
+    private boolean isInMorningTail(Calendar cal, int ns, int ne) {
+        if (ns == ne) return false;
+        int nowMin = cal.get(Calendar.HOUR_OF_DAY) * 60 + cal.get(Calendar.MINUTE);
+        int startMin = ns * 60;
+        int endMin = ne * 60;
+        int totalMin = endMin > startMin ? (endMin - startMin) : (24 * 60 - startMin + endMin);
+        int remMin = endMin >= nowMin ? (endMin - nowMin) : (24 * 60 - nowMin + endMin);
+        int morningWindowMin = Math.min(180, Math.max(30, totalMin / 2));
+        return remMin > 0 && remMin <= morningWindowMin;
+    }
+
+    private int nightSessionKey(Calendar cal) {
+        Calendar copy = (Calendar) cal.clone();
+        if (copy.get(Calendar.HOUR_OF_DAY) < 12) {
+            copy.add(Calendar.DAY_OF_YEAR, -1);
+        }
+        return copy.get(Calendar.YEAR) * 10000
+                + (copy.get(Calendar.MONTH) + 1) * 100
+                + copy.get(Calendar.DAY_OF_MONTH);
     }
 
     private boolean isNight() {
-        if (cfgNS == cfgNE) return false;
+        if (!cfgNight || cfgNS == cfgNE) return false;
         int h = Calendar.getInstance().get(Calendar.HOUR_OF_DAY);
-        if (cfgNS < cfgNE) return h >= cfgNS && h < cfgNE;
+        if (cfgNS < cfgNE) {
+            return h >= cfgNS && h < cfgNE;
+        }
         return h >= cfgNS || h < cfgNE;
     }
 
-    /* ---------------- doze 状态 ---------------- */
+    private void updateNightActive() {
+        if (!cfgNight) {
+            mNightActive = false;
+            return;
+        }
+        Calendar cal = Calendar.getInstance();
+        boolean inNight = isNight();
+        if (!inNight) {
+            mNightActive = false;
+            return;
+        }
+        if (cfgNightSmart && mNightClearedSession == nightSessionKey(cal)) {
+            mNightActive = false;
+            return;
+        }
+        mNightActive = true;
+    }
 
-    public void onDozeState(String state) {
-        if (state == null) return;
-        boolean on = state.startsWith("DOZE_AOD");
-        if (on) {
-            if (mAod) {
-                refreshConfig();
-                updateNightActive();
-                boolean night = mNightActive;
-                boolean now = cfgEnabled && !night && !mFaceDownPaused && !mTimedOut;
-                if (now != mIntervene) {
-                    mIntervene = now;
-                    if (mIntervene && mView != null) {
-                        mView.setMaskAlpha(cfgMask);
-                        mView.setVisibility(View.VISIBLE);
-                        animateTo(1f, cfgAnimIn);
-                    } else {
-                        animateTo(0f, cfgAnimOut);
-                        if ((night && cfgNightMode == 1) || mFaceDownPaused) {
-                            if (requestAodPaused()) log("aod paused (screen off)");
-                        }
-                    }
-                    log("AOD re-eval intervene=" + mIntervene + " night=" + night + " faceDown=" + mFaceDownPaused);
-                }
-                applyScrimNow();
-                if (mIntervene) ensureAodVisible();
+    private void checkAodTimeout() {
+        if (!cfgTimeoutOn || !mAod || mAodEnterTs <= 0L) {
+            if (!cfgTimeoutOn) mAodTimedOut = false;
+            return;
+        }
+        long elapsed = SystemClock.elapsedRealtime() - mAodEnterTs;
+        long limitMs = (long) cfgTimeoutMin * 60000L;
+        if (elapsed >= limitMs && !mAodTimedOut) {
+            mAodTimedOut = true;
+            log("AOD timed out after " + cfgTimeoutMin + "m mode=" + cfgTimeoutMode);
+            applyAodTimeout();
+        }
+    }
+
+    private final Runnable mAodSettleRun = new Runnable() {
+        @Override
+        public void run() {
+            if (!isWallpaperAodVisible()) return;
+            placeBelowPanel();
+            clearOpaqueBackgrounds();
+            applyScrimNow();
+            syncDozeBrightness(true);
+        }
+    };
+
+    private final Runnable mDiagRun = new Runnable() {
+        @Override
+        public void run() {
+            if (mView == null) return;
+            ViewGroup p = mView.getParent() instanceof ViewGroup ? (ViewGroup) mView.getParent() : null;
+            int idx = p != null ? p.indexOfChild(mView) : -1;
+            int panelIdx = -1;
+            if (p != null) {
+                View panel = findPanelChild(p);
+                if (panel != null) panelIdx = p.indexOfChild(panel);
+            }
+            float sb = readScrimViewDirectAlpha("mScrimBehind");
+            float sn = readScrimViewDirectAlpha("mNotificationsScrim");
+            float sf = readScrimViewDirectAlpha("mScrimInFront");
+            log("diag w=" + mView.getWidth() + " h=" + mView.getHeight()
+                    + " alpha=" + mView.getAlpha()
+                    + " scale=" + mView.getScaleX()
+                    + " mask=" + cfgMask
+                    + " bright=" + mLastRawBrightnessInt + "/" + mLastAppliedBrightnessInt
+                    + " vis=" + mView.getVisibility()
+                    + " idx=" + idx + " panel=" + panelIdx
+                    + " children=" + (p != null ? p.getChildCount() : -1)
+                    + " scrim=" + sb + "/" + sn + "/" + sf);
+        }
+    };
+
+    private void applyAodTimeout() {
+        mH.removeCallbacks(mAodSettleRun);
+        mH.removeCallbacks(mDiagRun);
+        if (cfgTimeoutMode == 1) {
+            animateTo(0f, cfgAnimOut);
+            restoreOpaqueBackgrounds();
+            restoreClocks();
+            restoreScrimAlphas();
+            stopScrimKeeper();
+            stopTick();
+            mH.post(this::requestAodPaused);
+        } else {
+            degradeToClockOnly();
+        }
+    }
+
+    private void degradeToClockOnly() {
+        mH.removeCallbacks(mAodSettleRun);
+        mH.removeCallbacks(mDiagRun);
+        syncDozeBrightness(false);
+        animateTo(0f, cfgAnimOut);
+        restoreOpaqueBackgrounds();
+        restoreClocks();
+        restoreScrimAlphas();
+        stopScrimKeeper();
+    }
+
+    private boolean isWallpaperAodVisible() {
+        return cfgEnabled && mAod && !mNightActive && !mAodTimedOut && !mFaceDownPaused;
+    }
+
+    private void applyAod(boolean force) {
+        if (Looper.myLooper() != Looper.getMainLooper()) {
+            mH.post(() -> applyAodInner(force));
+        } else {
+            applyAodInner(force);
+        }
+    }
+
+    private void applyAodInner(boolean force) {
+        if (mView == null) return;
+
+        if (isWallpaperAodVisible()) {
+            mBouncerBg = false;
+            ensureWallpaperLoaded();
+            placeBelowPanel();
+            mH.post(this::placeBelowPanel);
+            clearOpaqueBackgrounds();
+            mView.setBlur(0f);
+            mView.setMaskAlpha(cfgMask);
+            if (cfgShift) {
+                kickShift();
+            } else {
+                mView.setPixelShift(0f, 0f);
+            }
+            // Note: never call hideAllClocks() here so AOD system clock stays intact!
+            restoreClocks();
+            ensureLockscreenCenterOffset();
+            if (force && mTargetAlpha >= 0.99f && mAnim == null) {
+                applyViewScale(getTargetWallpaperScale());
+            }
+            animateTo(1.0f, cfgAnimIn);
+            applyScrimNow();
+            syncDozeBrightness(true);
+            startScrimKeeper();
+            startTick();
+            mH.removeCallbacks(mAodSettleRun);
+            mH.postDelayed(mAodSettleRun, 550L);
+            mH.removeCallbacks(mDiagRun);
+            mH.postDelayed(mDiagRun, 1500L);
+            return;
+        }
+
+        mH.removeCallbacks(mAodSettleRun);
+        mH.removeCallbacks(mDiagRun);
+
+        if (mAod && mFaceDownPaused) {
+            animateTo(0f, Math.min(cfgAnimOut, 200));
+            restoreOpaqueBackgrounds();
+            restoreClocks();
+            restoreScrimAlphas();
+            stopScrimKeeper();
+            stopTick();
+            mH.post(this::requestAodPaused);
+            return;
+        }
+
+        if (mAod && mNightActive) {
+            if (cfgNightMode == 1) {
+                animateTo(0f, cfgAnimOut);
+                restoreOpaqueBackgrounds();
+                restoreClocks();
+                restoreScrimAlphas();
+                stopScrimKeeper();
+                stopTick();
+                mH.post(this::requestAodPaused);
+            } else {
+                degradeToClockOnly();
+                startTick();
+            }
+            return;
+        }
+
+        if (mAod && mAodTimedOut) {
+            applyAodTimeout();
+            return;
+        }
+
+        if (!mBouncerBg) {
+            animateTo(0f, cfgAnimOut);
+            restoreOpaqueBackgrounds();
+            restoreClocks();
+            restoreScrimAlphas();
+            stopScrimKeeper();
+            stopTick();
+        }
+    }
+
+    private boolean requestAodPaused() {
+        if (mDozeMachine == null) return false;
+        try {
+            Object st = XposedHelpers.callMethod(mDozeMachine, "getState");
+            String name = String.valueOf(st);
+            if ("DOZE_AOD_PAUSED".equals(name) || "DOZE_AOD_PAUSING".equals(name)) {
+                return true;
+            }
+            if (!"DOZE_AOD".equals(name) && !"DOZE_AOD_DOCKED".equals(name)) {
+                return false;
+            }
+            @SuppressWarnings("unchecked")
+            Class<? extends Enum> stCls = (Class<? extends Enum>) st.getClass();
+            Object target = Enum.valueOf(stCls, "DOZE_AOD_PAUSED");
+            XposedHelpers.callMethod(mDozeMachine, "requestState", target);
+            log("requestAodPaused -> DOZE_AOD_PAUSED");
+            return true;
+        } catch (Throwable t) {
+            log("requestAodPaused err: " + t);
+            return false;
+        }
+    }
+
+    private boolean requestAodResume() {
+        if (mDozeMachine == null) return false;
+        try {
+            Object st = XposedHelpers.callMethod(mDozeMachine, "getState");
+            String name = String.valueOf(st);
+            if ("DOZE_AOD".equals(name)) {
+                return true;
+            }
+            if (!"DOZE_AOD_PAUSED".equals(name) && !"DOZE_AOD_PAUSING".equals(name)) {
+                return false;
+            }
+            @SuppressWarnings("unchecked")
+            Class<? extends Enum> stCls = (Class<? extends Enum>) st.getClass();
+            Object target = Enum.valueOf(stCls, "DOZE_AOD");
+            XposedHelpers.callMethod(mDozeMachine, "requestState", target);
+            log("requestAodResume -> DOZE_AOD");
+            return true;
+        } catch (Throwable t) {
+            log("requestAodResume err: " + t);
+            return false;
+        }
+    }
+
+    public void onScrimChanged(Object sc) {
+        if (sc == null) return;
+        mScrimController = sc;
+        if (mInApplyState) return;
+
+        String st = readScrimState(sc);
+        if ("UNLOCKED".equals(st)) {
+            if (cfgShade && isShadeOverlayActive(st)) {
+                ensureBouncerOrShadeBg(true);
+                applyScrim(sc);
                 return;
             }
-            applyAod(true);
-        } else {
-            if (!mAod) return;
-            applyAod(false);
+            if (mBouncerBg || (mView != null && mView.getVisibility() == View.VISIBLE && !mAod)) {
+                runOnMain(this::hideBouncerBg);
+            }
+            return;
+        }
+
+        if ("AOD".equals(st) && !mAod && !isScreenOn() && !mFaceDownPaused
+                && !"DOZE_AOD_PAUSED".equals(mDozeState)) {
+            onDozeState("DOZE_AOD");
+            return;
+        }
+
+        if (isWallpaperAodVisible()) {
+            applyScrim(sc);
+            return;
+        }
+
+        if (cfgEnabled && isScreenOn()) {
+            boolean isBouncer = "BOUNCER".equals(st) || "BOUNCER_SCRIMMED".equals(st)
+                    || ("KEYGUARD".equals(st) && hasBouncerView(mRoot, 0));
+            boolean isShade = cfgShade && isShadeOverlayActive(st);
+            if (isBouncer || isShade) {
+                ensureBouncerOrShadeBg(isShade && !isBouncer);
+                applyScrim(sc);
+                return;
+            }
+        }
+
+        if (mBouncerBg && !isWallpaperAodVisible()) {
+            runOnMain(this::hideBouncerBg);
         }
     }
 
-    private void applyAod(boolean on) {
-        if (mInApply) {
-            log("applyAod skip(reentry) on=" + on + " cur=" + mAod);
-            return;
-        }
-        mInApply = true;
+    private String readScrimState(Object sc) {
+        if (sc == null) return "";
         try {
-            applyAodInner(on);
-        } finally {
-            mInApply = false;
+            Object st = XposedHelpers.getObjectField(sc, "mState");
+            return st != null ? String.valueOf(st) : "";
+        } catch (Throwable t) {
+            return "";
         }
     }
 
-    private void applyAodInner(boolean on) {
-        refreshConfig();
-        mAod = on;
-        if (!on && isScreenOn()) {
-            mFaceDownPaused = false;
-            releaseFaceDownWakeLock();
-        }
-        updateNightActive();
-        boolean night = mNightActive;
-        mIntervene = on && cfgEnabled && !night && !mFaceDownPaused;
-        updatePostureSensors();
+    private boolean isShadeOverlayActive(String scState) {
+        if (!cfgShade || mRoot == null || !isScreenOn()) return false;
+        if (mRoot.getVisibility() != View.VISIBLE || mRoot.getHeight() <= 0) return false;
+        if ("SHADE_LOCKED".equals(scState)) return true;
+        if (mScrimController == null) return false;
+        float notifAlpha = readScrimFloat(mScrimController, "mNotificationsAlpha");
+        if (notifAlpha > 0.08f) return true;
+        float notifViewAlpha = readScrimViewAlpha(mScrimController, "mNotificationsScrim");
+        return notifViewAlpha > 0.08f;
+    }
 
-        if (mView == null) {
-            log("AOD " + (on ? "on" : "off") + " but view null");
+    private void ensureBouncerOrShadeBg(final boolean isShade) {
+        runOnMain(() -> {
+            if (mView == null) return;
+            mBouncerLast = SystemClock.elapsedRealtime();
+            boolean changed = !mBouncerBg;
+            mBouncerBg = true;
+            ensureWallpaperLoaded();
+            if (changed) {
+                ensureLockscreenCenterOffset();
+            }
+            placeBelowPanel();
+            applyViewScale(getTargetWallpaperScale());
+            mView.setBlur(isShade ? 0f : 22f);
+            mView.setMaskAlpha(isShade ? cfgShadeMask : cfgMask);
+            mView.setPixelShift(0f, 0f);
+            ensureKeyguardDim();
+            clearOpaqueBackgrounds();
+            if (!isShade) {
+                hideAllClocks();
+            } else {
+                restoreClocks();
+            }
+            if (changed || mTargetAlpha < 0.99f) {
+                animateTo(1.0f, Math.min(cfgAnimIn, 220));
+            }
+            startScrimKeeper();
+            startTick();
+        });
+    }
+
+    private void showBouncerBg() {
+        ensureBouncerOrShadeBg(false);
+    }
+
+    private void hideBouncerBg() {
+        if (!mBouncerBg && !mClocksHidden && !mScrimTouched) return;
+        mBouncerBg = false;
+        restoreClocks();
+        restoreOpaqueBackgrounds();
+        clearRootDim();
+        restoreScrimAlphas();
+        if (!isWallpaperAodVisible()) {
+            animateTo(0f, Math.min(cfgAnimOut, 200));
+            stopTick();
+        }
+    }
+
+    private void applyScrimNow() {
+        if (mScrimController != null) {
+            applyScrim(mScrimController);
+        }
+    }
+
+    private void applyScrim(Object sc) {
+        if (sc == null) return;
+        boolean aodVis = isWallpaperAodVisible();
+        if (!aodVis && !mBouncerBg) return;
+
+        try {
+            if (aodVis) {
+                clampScrimViewZero(sc, "mScrimBehind");
+                clampScrimViewZero(sc, "mNotificationsScrim");
+                clampScrimViewZero(sc, "mScrimInFront");
+                mScrimTouched = true;
+            } else if (mBouncerBg) {
+                clampScrimViewZero(sc, "mScrimBehind");
+                mScrimTouched = true;
+            }
+        } catch (Throwable t) {
+            log("applyScrim err: " + t);
+        }
+    }
+
+    private void clampScrimViewZero(Object sc, String fieldName) {
+        try {
+            Object sv = XposedHelpers.getObjectField(sc, fieldName);
+            if (!(sv instanceof View)) return;
+            View v = (View) sv;
+            if (v.getAlpha() > 0.001f) {
+                v.setAlpha(0f);
+            }
+        } catch (Throwable ignored) {
+        }
+    }
+
+    private float readScrimViewDirectAlpha(String fieldName) {
+        if (mScrimController == null) return -1f;
+        try {
+            Object sv = XposedHelpers.getObjectField(mScrimController, fieldName);
+            if (sv instanceof View) return ((View) sv).getAlpha();
+        } catch (Throwable ignored) {
+        }
+        return -1f;
+    }
+
+    private void restoreScrimAlphas() {
+        if (!mScrimTouched || mScrimController == null) {
+            mScrimTouched = false;
             return;
         }
-        if (mIntervene) {
-            mScrimCancelled = false;
-            mScrimRestored = false;
-            mScrimApplied = false;
-            mScrimHeal = 0;
-            mAodEnterTs = SystemClock.elapsedRealtime();
-            mTimedOut = false;
-            clearRootDim();
-            hideBouncerBg();
-            mView.setMaskAlpha(cfgMask);
-            if (mView.getVisibility() != View.VISIBLE) mView.setVisibility(View.VISIBLE);
-            mH.post(new Runnable() {
-                @Override
-                public void run() {
-                    placeBelowPanel();
+        mScrimTouched = false;
+        try {
+            for (String f : new String[] { "mScrimBehind", "mNotificationsScrim", "mScrimInFront" }) {
+                Object sv = XposedHelpers.getObjectField(mScrimController, f);
+                if (sv instanceof View && ((View) sv).getAlpha() < 0.999f) {
+                    ((View) sv).setAlpha(1f);
                 }
-            });
-            clearOpaqueBackgrounds();
-            startScrimKeeper();
-            animateTo(1f, cfgAnimIn);
-            kickShift();
-            final WallpaperAodView dv = mView;
-            mH.postDelayed(new Runnable() {
-                @Override
-                public void run() {
-                    ViewGroup p = dv.getParent() instanceof ViewGroup
-                            ? (ViewGroup) dv.getParent() : null;
-                    log("diag w=" + dv.getWidth() + " h=" + dv.getHeight()
-                            + " alpha=" + dv.getAlpha() + " vis=" + dv.getVisibility()
-                            + " idx=" + (p == null ? -1 : p.indexOfChild(dv))
-                            + " children=" + (p == null ? -1 : p.getChildCount()));
-                }
-            }, 1500L);
-        } else {
-            mScrimCancelled = false;
-            mH.removeCallbacks(mShiftTask);
-            restoreOpaqueBackgrounds();
-            stopScrimKeeper();
-            restoreScrimAlphas();
-            animateTo(0f, cfgAnimOut);
-            if (on && ((night && cfgNightMode == 1) || mFaceDownPaused)) {
-                if (mFaceDownPaused) hideAllClocks();
-                if (requestAodPaused()) log("aod paused (screen off)");
             }
+        } catch (Throwable ignored) {
         }
-        if (on) applyScrimNow();
-        log("AOD " + (on ? "ON" : "OFF") + " intervene=" + mIntervene + " night=" + night
-                + " faceDown=" + mFaceDownPaused
-                + " mask=" + cfgMask + " bright=" + cfgBright + " scale=" + cfgScale
-                + " anim=" + cfgAnimIn + "/" + cfgAnimOut);
+        mSavedBehindViewAlpha = -1f;
+        mSavedFrontViewAlpha = -1f;
+        callApplyState();
     }
 
-    private void animateTo(final float target, int dur) {
-        if (mView == null) return;
-        if (mAnim != null) {
-            try {
-                mAnim.cancel();
-            } catch (Throwable ignored) {
+    private boolean callApplyState() {
+        if (mScrimController == null || mInApplyState) return false;
+        mInApplyState = true;
+        try {
+            if (!mApplyStateMethodResolved) {
+                mApplyStateMethodResolved = true;
+                Class<?> cls = mScrimController.getClass();
+                outer:
+                for (String name : new String[] { "applyAndDispatchState", "applyState$1$1", "applyState" }) {
+                    Class<?> cur = cls;
+                    while (cur != null && cur != Object.class) {
+                        try {
+                            Method m = cur.getDeclaredMethod(name);
+                            m.setAccessible(true);
+                            mApplyStateMethod = m;
+                            break outer;
+                        } catch (NoSuchMethodException ignored) {
+                            cur = cur.getSuperclass();
+                        }
+                    }
+                }
             }
+            if (mApplyStateMethod != null) {
+                mApplyStateMethod.invoke(mScrimController);
+                return true;
+            }
+        } catch (Throwable ignored) {
+        } finally {
+            mInApplyState = false;
+        }
+        return false;
+    }
+
+    private void ensureKeyguardDim() {
+        if (mScrimController == null) return;
+        try {
+            Object behind = XposedHelpers.getObjectField(mScrimController, "mScrimBehind");
+            if (behind instanceof View) {
+                Object d = null;
+                try {
+                    d = XposedHelpers.getObjectField(behind, "mDrawable");
+                } catch (Throwable ignored) {
+                }
+                if (d instanceof Drawable) {
+                    Rect b = ((Drawable) d).getBounds();
+                    if (b.isEmpty() && mRoot != null && mRoot.getWidth() > 0 && mRoot.getHeight() > 0) {
+                        ((Drawable) d).setBounds(0, 0, mRoot.getWidth(), mRoot.getHeight());
+                    }
+                }
+            }
+        } catch (Throwable ignored) {
+        }
+    }
+
+    private void clearOpaqueBackgrounds() {
+        if (mRoot == null) return;
+        try {
+            int rw = mRoot.getWidth();
+            int rh = mRoot.getHeight();
+            for (int i = 0; i < mRoot.getChildCount(); i++) {
+                View c = mRoot.getChildAt(i);
+                if (c == null || c == mView) continue;
+                boolean isPanel = c.getClass().getName().endsWith("NotificationPanelView");
+                if (!isPanel) {
+                    if (c.getVisibility() != View.VISIBLE) continue;
+                    if (rw > 0 && rh > 0 && (c.getWidth() < rw - 4 || c.getHeight() < rh - 4)) continue;
+                }
+                Drawable bg = c.getBackground();
+                if (bg instanceof ColorDrawable && !mClearedViews.contains(c)) {
+                    mClearedViews.add(c);
+                    mClearedBgs.add(bg);
+                    c.setBackground(null);
+                    log("clear bg[" + i + "] " + c.getClass().getSimpleName()
+                            + " #" + Integer.toHexString(((ColorDrawable) bg).getColor()));
+                }
+            }
+        } catch (Throwable t) {
+            log("clearOpaque err: " + t);
+        }
+        if (mBouncerBg) {
+            clearOpaqueRecursive(mRoot, 0);
+        }
+    }
+
+    private void clearOpaqueRecursive(View v, int depth) {
+        if (v == null || v == mView || depth > 8) return;
+        String cls = v.getClass().getName();
+        if (cls.contains("Bouncer") || cls.contains("KeyguardBouncer") || cls.contains("ScrimView")) {
+            Drawable bg = v.getBackground();
+            if (bg != null && !mClearedViews.contains(v)) {
+                mClearedViews.add(v);
+                mClearedBgs.add(bg);
+                v.setBackground(null);
+            }
+        }
+        if (v instanceof ViewGroup) {
+            ViewGroup vg = (ViewGroup) v;
+            int n = vg.getChildCount();
+            for (int i = 0; i < n; i++) {
+                clearOpaqueRecursive(vg.getChildAt(i), depth + 1);
+            }
+        }
+    }
+
+    private void restoreOpaqueBackgrounds() {
+        for (int i = mClearedViews.size() - 1; i >= 0; i--) {
+            View v = mClearedViews.get(i);
+            Drawable d = mClearedBgs.get(i);
+            if (v != null && d != null && v.getBackground() == null) {
+                v.setBackground(d);
+            }
+        }
+        mClearedViews.clear();
+        mClearedBgs.clear();
+    }
+
+    private void clearRootDim() {
+        if (mRoot != null && mRoot.getAlpha() != 1f) {
+            mRoot.setAlpha(1f);
+        }
+    }
+
+    private void hideAllClocks() {
+        if (mRoot == null || mClocksHidden) return;
+        mClocks.clear();
+        mClocksAlpha.clear();
+        collectClocks(mRoot, 0);
+        for (int i = 0; i < mClocks.size(); i++) {
+            View cv = mClocks.get(i);
+            cv.setAlpha(0f);
+        }
+        mClocksHidden = true;
+    }
+
+    private void restoreClocks() {
+        if (!mClocksHidden && mClocks.isEmpty()) return;
+        for (int i = 0; i < mClocks.size(); i++) {
+            View cv = mClocks.get(i);
+            float orig = mClocksAlpha.get(i);
+            if (cv != null) {
+                cv.setAlpha(orig);
+            }
+        }
+        mClocks.clear();
+        mClocksAlpha.clear();
+        if (mClockView != null) {
+            mClockView.setAlpha(mClockOldAlpha);
+            mClockView = null;
+        }
+        mClocksHidden = false;
+    }
+
+    private void collectClocks(View v, int depth) {
+        if (v == null || v == mView || depth > 10) return;
+        String cls = v.getClass().getName();
+        // Never touch the status bar clock!
+        if ("com.android.systemui.statusbar.policy.Clock".equals(cls)
+                || cls.contains("StatusBar")
+                || cls.contains("PhoneStatusBar")) {
+            return;
+        }
+        String resName = "";
+        try {
+            if (v.getId() != View.NO_ID) {
+                resName = v.getResources().getResourceEntryName(v.getId());
+            }
+        } catch (Throwable ignored) {
+        }
+        if ("clock".equals(resName) || resName.contains("keyguard_status_bar")) {
+            return;
+        }
+        boolean isKeyguardClock = cls.contains("KeyguardClock")
+                || cls.contains("AnimatableClockView")
+                || cls.contains("ClockFrame")
+                || cls.contains("KeyguardSliceView")
+                || resName.contains("lockscreen_clock")
+                || resName.contains("keyguard_clock");
+        if (isKeyguardClock) {
+            if (!mClocks.contains(v)) {
+                mClocks.add(v);
+                mClocksAlpha.add(v.getAlpha());
+            }
+            return;
+        }
+        if (v instanceof ViewGroup) {
+            ViewGroup vg = (ViewGroup) v;
+            int n = vg.getChildCount();
+            for (int i = 0; i < n; i++) {
+                collectClocks(vg.getChildAt(i), depth + 1);
+            }
+        }
+    }
+
+    private boolean hasBouncerView(View v, int depth) {
+        if (v == null || v == mView || depth > 6) return false;
+        if (v.getVisibility() != View.VISIBLE || v.getAlpha() < 0.05f) return false;
+        String cls = v.getClass().getName();
+        if (cls.contains("KeyguardBouncer") || cls.contains("BouncerView") || cls.contains("KeyguardSecurityContainer")) {
+            return v.getWidth() > 0 && v.getHeight() > 0;
+        }
+        if (v instanceof ViewGroup) {
+            ViewGroup vg = (ViewGroup) v;
+            for (int i = 0; i < vg.getChildCount(); i++) {
+                if (hasBouncerView(vg.getChildAt(i), depth + 1)) return true;
+            }
+        }
+        return false;
+    }
+
+    private View findPanelChild(ViewGroup root) {
+        if (root == null) return null;
+        int n = root.getChildCount();
+        for (int i = 0; i < n; i++) {
+            View c = root.getChildAt(i);
+            if (c != null && c != mView && c.getClass().getName().endsWith("NotificationPanelView")) {
+                return c;
+            }
+        }
+        for (int i = 0; i < n; i++) {
+            View c = root.getChildAt(i);
+            if (c == null || c == mView) continue;
+            String cn = c.getClass().getName();
+            if (cn.contains("KeyguardRootView") || cn.endsWith("ShadeRootView") || cn.contains("NotificationPanel")) {
+                return c;
+            }
+        }
+        return null;
+    }
+
+    private void placeBelowPanel() {
+        if (mRoot == null || mView == null) return;
+        View panel = findPanelChild(mRoot);
+        if (panel == null) {
+            log("place: panel not found children=" + mRoot.getChildCount());
+            return;
+        }
+        int curIdx = mRoot.indexOfChild(mView);
+        int panelIdx = mRoot.indexOfChild(panel);
+        if (!cfgTop) {
+            if (curIdx >= 0 && curIdx == panelIdx - 1) {
+                return;
+            }
+            if (curIdx >= 0) {
+                mRoot.removeView(mView);
+            }
+            int target = Math.max(0, mRoot.indexOfChild(panel));
+            FrameLayout.LayoutParams lp = new FrameLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT);
+            mRoot.addView(mView, target, lp);
+            log("place: idx=" + mRoot.indexOfChild(mView)
+                    + " panel=" + mRoot.indexOfChild(panel)
+                    + " children=" + mRoot.getChildCount());
+        } else {
+            if (curIdx >= 0 && curIdx == panelIdx + 1) {
+                return;
+            }
+            if (curIdx >= 0) {
+                mRoot.removeView(mView);
+            }
+            int target = Math.min(mRoot.getChildCount(), mRoot.indexOfChild(panel) + 1);
+            FrameLayout.LayoutParams lp = new FrameLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT);
+            mRoot.addView(mView, target, lp);
+            log("place(top): idx=" + mRoot.indexOfChild(mView)
+                    + " panel=" + mRoot.indexOfChild(panel)
+                    + " children=" + mRoot.getChildCount());
+        }
+    }
+
+    private void animateTo(final float targetAlpha, int durationMs) {
+        if (mView == null) return;
+        float clamped = clampFloat(targetAlpha, 0f, 1f);
+        if (mShowingTarget && Math.abs(clamped - mTargetAlpha) < 0.01f) {
+            if (clamped > 0f && mView.getVisibility() != View.VISIBLE) {
+                mView.setVisibility(View.VISIBLE);
+            }
+            return;
+        }
+        mShowingTarget = true;
+        mTargetAlpha = clamped;
+
+        if (mAnim != null) {
+            mAnim.cancel();
             mAnim = null;
         }
-        float from = mView.getAlpha();
-        if (Math.abs(from - target) < 0.002f) {
-            mView.setAlpha(target);
-            if (target <= 0.002f) mView.setVisibility(View.GONE);
+
+        float startAlpha = mView.getAlpha();
+        if (clamped > 0f && mView.getVisibility() != View.VISIBLE) {
+            mView.setAlpha(0f);
+            applyViewScale(mBaseWallpaperScale);
+            mView.setVisibility(View.VISIBLE);
+            startAlpha = 0f;
+        }
+        if (durationMs <= 16 || Math.abs(startAlpha - clamped) < 0.01f) {
+            mView.setAlpha(clamped);
+            float s = lerpWallpaperScale(clamped);
+            if (clamped <= 0.002f) {
+                mView.setVisibility(View.GONE);
+                applyViewScale(mBaseWallpaperScale);
+            } else {
+                applyViewScale(s);
+            }
             return;
         }
-        if (target > 0f) mView.setVisibility(View.VISIBLE);
 
-        ValueAnimator anim = ValueAnimator.ofFloat(from, target);
-        anim.setDuration(Math.max(60, dur));
+        ValueAnimator anim = ValueAnimator.ofFloat(startAlpha, clamped);
+        anim.setDuration(Math.max(60, durationMs));
         anim.setInterpolator(new PathInterpolator(0.4f, 0f, 0.2f, 1f));
-        anim.addUpdateListener(new ValueAnimator.AnimatorUpdateListener() {
-            @Override
-            public void onAnimationUpdate(ValueAnimator a) {
-                if (mView == null) return;
+        anim.addUpdateListener(a -> {
+            if (mView != null) {
                 float v = (Float) a.getAnimatedValue();
                 mView.setAlpha(v);
-                float s = 1f + (cfgScale - 1f) * v;
-                mView.setScaleX(s);
-                mView.setScaleY(s);
+                applyViewScale(lerpWallpaperScale(v));
             }
         });
         anim.addListener(new AnimatorListenerAdapter() {
+            private boolean cancelled = false;
+
             @Override
-            public void onAnimationEnd(Animator a) {
-                if (mAnim == a) mAnim = null;
-                if (mView != null && target <= 0.002f) {
+            public void onAnimationCancel(Animator animation) {
+                cancelled = true;
+            }
+
+            @Override
+            public void onAnimationEnd(Animator animation) {
+                if (mAnim == animation) mAnim = null;
+                if (cancelled || mView == null) return;
+                if (clamped <= 0.002f) {
                     mView.setVisibility(View.GONE);
-                    mView.setScaleX(1f);
-                    mView.setScaleY(1f);
+                    applyViewScale(mBaseWallpaperScale);
                 }
             }
         });
@@ -576,1033 +1458,397 @@ public final class AodController {
         anim.start();
     }
 
-    private void kickShift() {
-        mH.removeCallbacks(mShiftTask);
-        mH.postDelayed(mShiftTask, 90000L);
+    private void ensureWallpaperLoaded() {
+        if (mBitmap != null && !mBitmap.isRecycled()) return;
+        loadWallpaper(0);
     }
 
-    /* ---------------- scrim ---------------- */
-
-    public void onScrimChanged(Object ctrl) {
-        if (ctrl == null) return;
-        mScrimController = ctrl;
-        boolean dozing = false;
-        String state = "";
-        try {
-            Object d = XposedHelpers.getObjectField(ctrl, "mDozing");
-            if (d instanceof Boolean) dozing = ((Boolean) d).booleanValue();
-        } catch (Throwable ignored) {
+    private void loadWallpaper(int reason) {
+        if (mCtx == null || mWpLoading) return;
+        long now = SystemClock.elapsedRealtime();
+        if (reason == 0 && mBitmap != null && !mBitmap.isRecycled() && (now - mLastWpLoadTs) < 5000L) {
+            return;
         }
-        try {
-            Object s = XposedHelpers.getObjectField(ctrl, "mState");
-            if (s != null) state = String.valueOf(s);
-        } catch (Throwable ignored) {
-        }
-        boolean aod = dozing || state.indexOf("AOD") >= 0;
-        if (aod) {
-            if (!mAod) log("scrim->AOD dozing=" + dozing + " state=" + state);
-            onDozeState("DOZE_AOD");
-        } else if (mAod) {
-            if (!isScreenOn()) {
-                log("scrim->leave ignored (screen off, state=" + state + ")");
-                return;
-            }
-            log("scrim->leave dozing=" + dozing + " state=" + state);
-            onDozeState("OTHER");
-        }
-    }
-
-    private void clearOpaqueBackgrounds() {
-        try {
-            if (!mClearedViews.isEmpty()) {
-                restoreOpaqueBackgrounds();
-            }
-            ViewGroup root = (mView != null && mView.getParent() instanceof ViewGroup)
-                    ? (ViewGroup) mView.getParent() : mParent;
-            if (root == null) return;
-            int rw = root.getWidth();
-            int rh = root.getHeight();
-            for (int i = 0; i < root.getChildCount(); i++) {
-                View c = root.getChildAt(i);
-                if (c == mView) continue;
-                if (c.getVisibility() != View.VISIBLE) continue;
-                if (c.getWidth() < rw - 4 || c.getHeight() < rh - 4) continue;
-                android.graphics.drawable.Drawable bg = c.getBackground();
-                int col = 0;
-                boolean opaque = false;
-                if (bg instanceof android.graphics.drawable.ColorDrawable) {
-                    col = ((android.graphics.drawable.ColorDrawable) bg).getColor();
-                    opaque = true;
-                }
-                if (opaque) {
-                    mClearedViews.add(c);
-                    mClearedBgs.add(bg);
-                    c.setBackground(null);
-                    log("clear bg[" + i + "] " + c.getClass().getSimpleName()
-                            + " #" + Integer.toHexString(col));
-                } else {
-                    log("full[" + i + "] " + c.getClass().getSimpleName()
-                            + " bg=" + (bg == null ? "null" : bg.getClass().getSimpleName()));
-                }
-            }
-        } catch (Throwable t) {
-            log("clearOpaque fail " + t);
-        }
-    }
-
-    private void restoreOpaqueBackgrounds() {
-        try {
-            for (int i = 0; i < mClearedViews.size(); i++) {
-                mClearedViews.get(i).setBackground(mClearedBgs.get(i));
-            }
-            if (!mClearedViews.isEmpty()) log("restored " + mClearedViews.size() + " bg");
-            mClearedViews.clear();
-            mClearedBgs.clear();
-        } catch (Throwable t) {
-            log("restore fail " + t);
-        }
-    }
-
-    private final Runnable mScrimKeeper = new Runnable() {
-        @Override
-        public void run() {
-            if (!mAod || !mIntervene) return;
-            if (mScrimController != null) applyScrim(mScrimController);
-            mH.postDelayed(this, 200L);
-        }
-    };
-
-    private void startScrimKeeper() {
-        mH.removeCallbacks(mScrimKeeper);
-        mH.post(mScrimKeeper);
-    }
-
-    private void stopScrimKeeper() {
-        mH.removeCallbacks(mScrimKeeper);
-    }
-
-    private final Runnable mTick = new Runnable() {
-        @Override
-        public void run() {
+        mWpLoading = true;
+        mLastWpLoadTs = now;
+        ensureBgThread();
+        mBgH.post(() -> {
+            Bitmap loaded = null;
             try {
-                tickLogic();
+                loaded = decodeWallpaperSafe();
             } catch (Throwable t) {
-                log("tick fail " + t);
+                log("loadWallpaper err: " + t);
+            } finally {
+                mWpLoading = false;
             }
-            mH.postDelayed(this, 300L);
+            if (loaded != null) {
+                final Bitmap finalBmp = loaded;
+                mH.post(() -> {
+                    mBitmap = finalBmp;
+                    if (mView != null) {
+                        mView.setBitmap(finalBmp);
+                    }
+                    log("wallpaper loaded " + finalBmp.getWidth() + "x" + finalBmp.getHeight()
+                            + " cfg=" + finalBmp.getConfig());
+                });
+            }
+        });
+    }
+
+    private Bitmap decodeWallpaperSafe() {
+        WallpaperManager wm = WallpaperManager.getInstance(mCtx);
+        if (wm == null) return null;
+
+        int[] flags = new int[] { WallpaperManager.FLAG_LOCK, WallpaperManager.FLAG_SYSTEM };
+        for (int flag : flags) {
+            try (ParcelFileDescriptor pfd = wm.getWallpaperFile(flag)) {
+                if (pfd != null) {
+                    Bitmap b = decodeBoundedPfd(pfd);
+                    if (b != null) return b;
+                }
+            } catch (Throwable ignored) {
+            }
+        }
+
+        Drawable d = null;
+        try {
+            d = wm.getDrawable();
+        } catch (Throwable ignored) {
+        }
+        if (d == null) {
+            try {
+                d = wm.getFastDrawable();
+            } catch (Throwable ignored) {
+            }
+        }
+        if (d == null) return null;
+
+        if (d instanceof BitmapDrawable) {
+            Bitmap b = ((BitmapDrawable) d).getBitmap();
+            if (b != null && !b.isRecycled()) {
+                if (Build.VERSION.SDK_INT >= 26 && b.getConfig() == Bitmap.Config.HARDWARE) {
+                    return b.copy(Bitmap.Config.ARGB_8888, false);
+                }
+                return ensureArgbOrDownsample(b);
+            }
+        }
+
+        int w = Math.max(1, d.getIntrinsicWidth());
+        int h = Math.max(1, d.getIntrinsicHeight());
+        while (Math.max(w, h) > 3200) {
+            w = Math.max(1, w / 2);
+            h = Math.max(1, h / 2);
+        }
+        Bitmap out = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888);
+        Canvas c = new Canvas(out);
+        d.setBounds(0, 0, w, h);
+        d.draw(c);
+        return out;
+    }
+
+    private static Bitmap decodeBoundedPfd(ParcelFileDescriptor pfd) {
+        BitmapFactory.Options bounds = new BitmapFactory.Options();
+        bounds.inJustDecodeBounds = true;
+        BitmapFactory.decodeFileDescriptor(pfd.getFileDescriptor(), null, bounds);
+        int w = bounds.outWidth;
+        int h = bounds.outHeight;
+        if (w <= 0 || h <= 0) return null;
+
+        int sample = 1;
+        while (Math.max(w / sample, h / sample) > 3600) {
+            sample *= 2;
+        }
+        BitmapFactory.Options opts = new BitmapFactory.Options();
+        opts.inSampleSize = sample;
+        opts.inPreferredConfig = Bitmap.Config.ARGB_8888;
+        opts.inMutable = false;
+        Bitmap bmp = BitmapFactory.decodeFileDescriptor(pfd.getFileDescriptor(), null, opts);
+        if (bmp != null && bmp.getConfig() != Bitmap.Config.ARGB_8888) {
+            Bitmap conv = bmp.copy(Bitmap.Config.ARGB_8888, false);
+            if (conv != null) {
+                bmp.recycle();
+                return conv;
+            }
+        }
+        return bmp;
+    }
+
+    private static Bitmap ensureArgbOrDownsample(Bitmap b) {
+        if (Math.max(b.getWidth(), b.getHeight()) <= 3600 && b.getConfig() == Bitmap.Config.ARGB_8888) {
+            return b;
+        }
+        float scale = 1f;
+        int max = Math.max(b.getWidth(), b.getHeight());
+        if (max > 3600) {
+            scale = 3600f / max;
+        }
+        int nw = Math.max(1, Math.round(b.getWidth() * scale));
+        int nh = Math.max(1, Math.round(b.getHeight() * scale));
+        Bitmap out = Bitmap.createBitmap(nw, nh, Bitmap.Config.ARGB_8888);
+        Canvas c = new Canvas(out);
+        c.drawBitmap(b, null, new Rect(0, 0, nw, nh), null);
+        return out;
+    }
+
+    private void kickShift() {
+        if (mView == null) return;
+        long now = SystemClock.elapsedRealtime();
+        if (now - mLastShiftTs < SHIFT_INTERVAL_MS && mLastShiftTs > 0L) return;
+        mLastShiftTs = now;
+        int dx = mRand.nextInt(13) - 6; // [-6..+6] px burn-in protection
+        int dy = mRand.nextInt(13) - 6;
+        mView.setPixelShift(dx, dy);
+    }
+
+    // ---- Adaptive / event-driven Tick & bounded ScrimKeeper ----
+
+    private final Runnable mTickRun = new Runnable() {
+        @Override
+        public void run() {
+            if (!mTickRunning) return;
+            tickLogic();
         }
     };
 
     private void startTick() {
-        mH.removeCallbacks(mTick);
-        mH.post(mTick);
+        long delay = nextTickDelayMs();
+        if (delay <= 0L) {
+            stopTick();
+            return;
+        }
+        mH.removeCallbacks(mTickRun);
+        mTickRunning = true;
+        mH.postDelayed(mTickRun, delay);
     }
 
-    private boolean isScreenOn() {
-        try {
-            android.os.PowerManager pm = (android.os.PowerManager)
-                    mCtx.getSystemService(Context.POWER_SERVICE);
-            return pm == null || pm.isInteractive();
-        } catch (Throwable t) {
-            return true;
+    private void stopTick() {
+        mTickRunning = false;
+        mH.removeCallbacks(mTickRun);
+    }
+
+    private long nextTickDelayMs() {
+        if (mFaceDownPaused) return -1L;
+        if (mBouncerBg && isScreenOn()) return BOUNCER_TICK_MS;
+        if (!mAod) return -1L;
+        if (mNightActive && cfgNightMode == 1) return -1L;
+        if (mAodTimedOut && cfgTimeoutMode == 1) return -1L;
+        if (isWallpaperAodVisible()) {
+            long d = cfgShift ? SHIFT_INTERVAL_MS : 30000L;
+            if (cfgTimeoutOn && mAodEnterTs > 0L) {
+                long rem = (long) cfgTimeoutMin * 60000L - (SystemClock.elapsedRealtime() - mAodEnterTs);
+                if (rem > 0L) d = Math.min(d, rem + 50L);
+            }
+            return Math.max(1000L, d);
         }
+        // Clock-only AOD night/timeout watch
+        return 30000L;
     }
 
     private void tickLogic() {
-        if (mCtx == null) return;
-        refreshConfig();
-        if (mView == null) return;
         updateNightActive();
-        boolean screenOn = isScreenOn();
-        String st = "";
-        if (mScrimController != null) {
-            try {
-                Object s = XposedHelpers.getObjectField(mScrimController, "mState");
-                if (s != null) st = String.valueOf(s);
-            } catch (Throwable ignored) {
-            }
-        }
-        boolean aodState = st.indexOf("AOD") >= 0;
-        updatePostureSensors();
+        checkAodTimeout();
 
-        if (!screenOn) {
-            if (aodState) {
-                if (!mAod) {
-                    log("tick: enter AOD state=" + st);
-                    applyAod(true);
-                } else if (mIntervene) {
-                    applyScrim(mScrimController);
-                    ensureAodVisible();
-                    checkAodTimeout();
-                }
-            } else if (mAod) {
-                log("tick: leave AOD state=" + st);
-                applyAod(false);
-            }
-            mShadeMode = false;
-            return;
-        }
-
-        if (mFaceDownPaused) {
-            mFaceDownPaused = false;
-            releaseFaceDownWakeLock();
-            restoreClocks();
-        }
-        if (mAod) {
-            log("tick: screen on -> leave AOD");
-            applyAod(false);
-        }
-        boolean shadeState = st.indexOf("SHADE") >= 0 || st.indexOf("UNLOCKED") >= 0;
-        if (cfgEnabled && cfgShade && shadeState) {
-            if (!mShadeMode) {
-                mShadeMode = true;
-                log("tick: shade wallpaper on mask=" + cfgShadeMask);
-            }
-            if (mAnim != null) {
-                try {
-                    mAnim.cancel();
-                } catch (Throwable ignored) {
-                }
-                mAnim = null;
-            }
-            if (mView.getVisibility() != View.VISIBLE) mView.setVisibility(View.VISIBLE);
-            mView.setAlpha(1f);
-            mView.setScaleX(1f);
-            mView.setScaleY(1f);
-            mView.setMaskAlpha(cfgShadeMask);
-            if (mScrimController != null) applyScrim(mScrimController);
-        } else {
-            if (mShadeMode) {
-                mShadeMode = false;
-                log("tick: shade wallpaper off");
-                try {
-                    XposedHelpers.callMethod(mScrimController, "applyAndDispatchState");
-                } catch (Throwable ignored) {
-                }
-            }
-            if (!mAod && !mBouncerBg) {
-                mView.setAlpha(0f);
-                mView.setVisibility(View.GONE);
-            }
-        }
-        ensureScrimForKeyguard();
-        ensureKeyguardDim();
-    }
-
-    public void setDozeMachine(Object dm) {
-        mDozeMachine = dm;
-    }
-
-    private void checkAodTimeout() {
-        if (!cfgTimeoutOn || cfgTimeoutMin <= 0 || mTimedOut) return;
-        long el = SystemClock.elapsedRealtime() - mAodEnterTs;
-        if (el < cfgTimeoutMin * 60000L) return;
-        mTimedOut = true;
-        applyAodTimeout();
-    }
-
-    private void applyAodTimeout() {
-        log("AOD timeout " + cfgTimeoutMin + "min mode=" + cfgTimeoutMode);
-        if (cfgTimeoutMode == 1) {
-            if (requestAodPaused()) {
-                log("timeout: aod paused (screen off)");
-                return;
-            }
-            log("timeout: pause failed, fallback clock-only");
-        }
-        degradeToClockOnly();
-    }
-
-    /** 退化为系统原生"仅时钟" AOD：撤掉壁纸与 scrim 压制 */
-    private void degradeToClockOnly() {
-        try {
-            mIntervene = false;
-            mH.removeCallbacks(mShiftTask);
-            stopScrimKeeper();
-            restoreOpaqueBackgrounds();
-            if (mView != null) {
-                mView.setBlur(0f);
-                mView.setAlpha(0f);
-                mView.setVisibility(View.GONE);
-            }
-            restoreScrimAlphas();
-            log("degraded: clock-only AOD");
-        } catch (Throwable t) {
-            log("degrade fail " + t);
-        }
-    }
-
-    /** 请求系统真正关掉 AOD（进入 DOZE_AOD_PAUSED，屏幕熄灭） */
-    private boolean requestAodPaused() {
-        if (mDozeMachine == null) return false;
-        try {
-            ClassLoader cl2 = mDozeMachine.getClass().getClassLoader();
-            Class<?> stCls = XposedHelpers.findClass(
-                    "com.android.systemui.doze.DozeMachine$State", cl2);
-            Object target = XposedHelpers.getStaticObjectField(stCls, "DOZE_AOD_PAUSED");
-            XposedHelpers.callMethod(mDozeMachine, "requestState", target);
-            return true;
-        } catch (Throwable t) {
-            log("requestAodPaused fail " + t);
-        }
-        return false;
-    }
-
-    /** 请求从 DOZE_AOD_PAUSED 恢复到 DOZE_AOD（反扣翻转朝上时恢复显示 AOD） */
-    private boolean requestAodResume() {
-        if (mDozeMachine == null) return false;
-        try {
-            ClassLoader cl2 = mDozeMachine.getClass().getClassLoader();
-            Class<?> stCls = XposedHelpers.findClass(
-                    "com.android.systemui.doze.DozeMachine$State", cl2);
-            Object target = XposedHelpers.getStaticObjectField(stCls, "DOZE_AOD");
-            XposedHelpers.callMethod(mDozeMachine, "requestState", target);
-            return true;
-        } catch (Throwable t) {
-            log("requestAodResume fail " + t);
-        }
-        return false;
-    }
-
-    private void ensureAodVisible() {
-        if (mView == null || !mIntervene) return;
-        try {
-            if (mView.getVisibility() != View.VISIBLE) {
-                log("heal: visibility GONE -> VISIBLE");
-                mView.setVisibility(View.VISIBLE);
-            }
-            float targetScale = 1f + (cfgScale - 1f);
-            if (mAnim == null) {
-                if (mView.getAlpha() < 0.95f) {
-                    log("heal: alpha " + mView.getAlpha() + " -> 1.0");
-                    mView.setAlpha(1f);
-                }
-                if (Math.abs(mView.getScaleX() - targetScale) > 0.02f) {
-                    mView.setScaleX(targetScale);
-                    mView.setScaleY(targetScale);
-                }
-            }
-            if (mView.getParent() == null) {
-                log("heal: no parent -> re-attach");
-                attachShadeView(mParent, mCtx);
-            }
-        } catch (Throwable t) {
-            log("heal fail " + t);
-        }
-    }
-
-    private void placeBelowPanel() {
-        try {
-            if (mView == null) return;
-            ViewGroup p = mView.getParent() instanceof ViewGroup
-                    ? (ViewGroup) mView.getParent() : null;
-            if (p == null) return;
-            View panel = null;
-            for (int i = 0; i < p.getChildCount(); i++) {
-                View c = p.getChildAt(i);
-                if (c.getClass().getName().endsWith("NotificationPanelView")) {
-                    panel = c;
-                    break;
-                }
-            }
-            if (panel == null) {
-                log("place: panel not found");
-                return;
-            }
-            int myIdx = p.indexOfChild(mView);
-            int pIdx = p.indexOfChild(panel);
-            if (myIdx >= 0 && myIdx == pIdx - 1) {
-                log("place: ok idx=" + myIdx + " panel=" + pIdx);
-                return;
-            }
-            p.removeView(mView);
-            int target = p.indexOfChild(panel);
-            if (target < 0) target = 0;
-            FrameLayout.LayoutParams lp2 = new FrameLayout.LayoutParams(
-                    ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT);
-            p.addView(mView, target, lp2);
-            log("place: moved idx=" + p.indexOfChild(mView) + " panel=" + p.indexOfChild(panel)
-                    + " children=" + p.getChildCount());
-        } catch (Throwable t) {
-            log("place fail " + t);
-        }
-    }
-
-    private String readScrimState() {
-        String st = "";
-        if (mScrimController != null) {
-            try {
-                Object s = XposedHelpers.getObjectField(mScrimController, "mState");
-                if (s != null) st = String.valueOf(s);
-            } catch (Throwable ignored) {
-            }
-        }
-        return st;
-    }
-
-    /**
-     * 指纹/密码界面（KEYGUARD / BOUNCER）需要 ScrimController 自己的暗化+模糊层。
-     * 我在 AOD 期间把三层 ScrimView 的 alpha 压成 0，如果退出时系统没重算，
-     * 密码键盘就会直接印在锁屏上（无背景、无模糊）。这里做兜底自愈。
-     */
-    /**
-     * 这个 ROM 的 ScrimView 在 AOD 之后内部绘制矩形会卡成 0x0（mBoundsRectF 为零面积），
-     * 改 alpha / tint 都画不出东西。所以这里自己补一层暗化：
-     * 只要系统 scrim 实际不可见，就在 NotificationShadeWindowView 上铺半透明黑，
-     * 密码键盘/时钟在其上层保持清晰，视觉上等于原生锁屏的压暗层。
-     */
-    private void ensureKeyguardDim() {
-        if (mParent == null) return;
-        try {
-            if (mAod || mIntervene) {
-                clearRootDim();
-                return;
-            }
-            String st = readScrimState();
-            // 只有"密码键盘弹出"才需要暗化背景；
-            // 普通锁屏（KEYGUARD：时钟/通知/人脸）必须保持原生、壁纸可见。
-            boolean kd = st.indexOf("BOUNCER") >= 0;
-            if (!kd && st.indexOf("KEYGUARD") >= 0) {
-                kd = hasBouncerView(mParent, 0);
-            }
-            long nowTs = SystemClock.uptimeMillis();
-            if (kd) {
-                mBouncerLast = nowTs;
-            } else if (mBouncerBg) {
-                boolean definitelyOut = st.indexOf("UNLOCKED") >= 0
-                        || st.indexOf("SHADE") >= 0 || st.indexOf("DREAMING") >= 0;
-                if (!definitelyOut && nowTs - mBouncerLast < 1500L) {
-                    kd = true; // 状态抖动时不急于撤掉模糊背景
-                }
-            }
-            if (!kd) {
-                clearRootDim();
+        if (mBouncerBg) {
+            if (!isScreenOn()) {
                 hideBouncerBg();
-                return;
-            }
-            View behind = null;
-            try {
-                Object o = XposedHelpers.getObjectField(mScrimController, "mScrimBehind");
-                if (o instanceof View) behind = (View) o;
-            } catch (Throwable ignored) {
-            }
-            // 真正的判据：ScrimDrawable 内部的绘制矩形是不是零面积。
-            // 这个 ROM 的 ScrimView 在 AOD 之后 mBoundsRectF 会卡成 0x0，
-            // 此时 getGlobalVisibleRect() 仍可能返回 true，但实际什么都没画。
-            boolean drawableOk = false;
-            if (behind != null) {
-                try {
-                    Object dr = XposedHelpers.getObjectField(behind, "mDrawable");
-                    if (dr != null) {
-                        Object rf = XposedHelpers.getObjectField(dr, "mBoundsRectF");
-                        if (rf instanceof android.graphics.RectF) {
-                            android.graphics.RectF f = (android.graphics.RectF) rf;
-                            drawableOk = f.width() > 100f && f.height() > 100f;
-                        } else {
-                            drawableOk = true;
-                        }
-                    }
-                } catch (Throwable ignored) {
+            } else {
+                String st = readScrimState(mScrimController);
+                boolean isBouncer = "BOUNCER".equals(st) || "BOUNCER_SCRIMMED".equals(st)
+                        || ("KEYGUARD".equals(st) && hasBouncerView(mRoot, 0));
+                boolean isShade = cfgShade && isShadeOverlayActive(st);
+                if (!isBouncer && !isShade) {
+                    hideBouncerBg();
+                } else if (SystemClock.elapsedRealtime() - mBouncerLast > 150L) {
+                    applyScrimNow();
                 }
             }
-            if (!mBouncerBg) showBouncerBg();
-            // 系统 scrim 能正常绘制时不做额外处理；画不出来时再叠一层淡暗化兜底
-            if (drawableOk) {
-                clearRootDim();
+        } else if (isWallpaperAodVisible()) {
+            if (cfgShift) kickShift();
+            applyScrimNow();
+        } else if (mAod) {
+            applyAodInner(false);
+        }
+
+        long next = nextTickDelayMs();
+        if (next > 0L && mTickRunning) {
+            mH.postDelayed(mTickRun, next);
+        } else {
+            mTickRunning = false;
+        }
+    }
+
+    private final Runnable mScrimKeeperRun = new Runnable() {
+        @Override
+        public void run() {
+            if (!mScrimKeeperRunning) return;
+            if ((!isWallpaperAodVisible() && !mBouncerBg) || mScrimKeeperTicks >= SCRIM_KEEPER_MAX_TICKS) {
+                stopScrimKeeper();
                 return;
             }
-            if (!mRootDimmed) {
-                mRootDimmed = true;
-                try {
-                    mRootDimBg = mParent.getBackground();
-                } catch (Throwable ignored) {
-                }
-                mParent.setBackgroundColor(0x4D000000);
-                log("dim root fallback state=" + st + " drawableOk=" + drawableOk);
-            }
+            mScrimKeeperTicks++;
+            applyScrimNow();
+            mH.postDelayed(this, SCRIM_KEEPER_INTERVAL_MS);
+        }
+    };
+
+    private void startScrimKeeper() {
+        mScrimKeeperTicks = 0;
+        if (!mScrimKeeperRunning) {
+            mScrimKeeperRunning = true;
+            mH.removeCallbacks(mScrimKeeperRun);
+            mH.postDelayed(mScrimKeeperRun, SCRIM_KEEPER_INTERVAL_MS);
+        }
+    }
+
+    private void stopScrimKeeper() {
+        mScrimKeeperRunning = false;
+        mH.removeCallbacks(mScrimKeeperRun);
+    }
+
+    // ---- Hardware Wakeup Posture Sensors (Flip-Off & Lift-Wake, zero continuous polling!) ----
+
+    private void probeSensorsOnce() {
+        if (mSensorsProbed || mSm == null) return;
+        mSensorsProbed = true;
+        try {
+            mProxSensor = mSm.getDefaultSensor(Sensor.TYPE_PROXIMITY, true);
+            if (mProxSensor == null) mProxSensor = mSm.getDefaultSensor(Sensor.TYPE_PROXIMITY);
+            mAccelSensor = mSm.getDefaultSensor(Sensor.TYPE_ACCELEROMETER);
+            mTiltSensor = findWakeupSensorByType(SENSOR_TYPE_TILT_DETECTOR);
+            mPickupSensor = findWakeupSensorByType(SENSOR_TYPE_PICK_UP_GESTURE);
+            log("sensors probed: prox=" + (mProxSensor != null ? mProxSensor.getName() : "none")
+                    + " tilt=" + (mTiltSensor != null ? mTiltSensor.getName() : "none")
+                    + " pickup=" + (mPickupSensor != null ? mPickupSensor.getName() : "none")
+                    + " accel=" + (mAccelSensor != null ? mAccelSensor.getName() : "none"));
         } catch (Throwable t) {
-            log("dim fail " + t);
+            log("probeSensors err: " + t);
         }
     }
 
-    private void hideAllClocks() {
-        if (!mClocks.isEmpty()) {
-            restoreClocks();
+    private Sensor findWakeupSensorByType(int type) {
+        if (mSm == null) return null;
+        try {
+            Sensor s = mSm.getDefaultSensor(type, true);
+            if (s != null) return s;
+        } catch (Throwable ignored) {
         }
-        mClocks.clear();
-        mClocksAlpha.clear();
-        collectClocks(mParent, 0);
-        for (int i = 0; i < mClocks.size(); i++) {
-            float curA = mClocks.get(i).getAlpha();
-            mClocksAlpha.add(Float.valueOf(curA > 0.05f ? curA : 1.0f));
-            mClocks.get(i).setAlpha(0f);
-        }
-        log("clocks hidden n=" + mClocks.size());
-    }
-
-    private void collectClocks(View v, int depth) {
-        if (v == null || depth > 12) return;
-        String n = v.getClass().getSimpleName();
-        boolean hit = n.contains("Clock") || n.endsWith("KeyguardStatusView")
-                || n.contains("SmartSpace");
-        if (hit) {
-            mClocks.add(v);
-            log("clock-cand[" + depth + "] " + v.getClass().getName()
-                    + " vis=" + v.getVisibility() + " a=" + v.getAlpha());
-        }
-        if (v instanceof ViewGroup) {
-            ViewGroup g = (ViewGroup) v;
-            for (int i = 0; i < g.getChildCount(); i++) {
-                collectClocks(g.getChildAt(i), depth + 1);
+        try {
+            List<Sensor> list = mSm.getSensorList(type);
+            if (list != null) {
+                for (Sensor s : list) {
+                    if (s != null && s.isWakeUpSensor()) return s;
+                }
+                if (!list.isEmpty()) return list.get(0);
             }
-        }
-    }
-
-    private void restoreClocks() {
-        for (int i = 0; i < mClocks.size(); i++) {
-            try {
-                mClocks.get(i).setAlpha(mClocksAlpha.get(i).floatValue());
-            } catch (Throwable ignored) {
-            }
-        }
-        if (!mClocks.isEmpty()) log("clocks restored n=" + mClocks.size());
-        mClocks.clear();
-        mClocksAlpha.clear();
-    }
-
-    private View findViewByClassName(View v, String suffix, int depth) {
-        if (v == null || depth > 12) return null;
-        if (v.getClass().getName().endsWith(suffix)) return v;
-        if (v instanceof ViewGroup) {
-            ViewGroup g = (ViewGroup) v;
-            for (int i = 0; i < g.getChildCount(); i++) {
-                View r = findViewByClassName(g.getChildAt(i), suffix, depth + 1);
-                if (r != null) return r;
-            }
+        } catch (Throwable ignored) {
         }
         return null;
     }
 
-    private boolean hasBouncerView(View v, int depth) {
-        if (v == null || depth > 10) return false;
-        if (!(v instanceof ViewGroup)) return false;
-        ViewGroup g = (ViewGroup) v;
-        for (int i = 0; i < g.getChildCount(); i++) {
-            View c = g.getChildAt(i);
-            if (c == null || c.getVisibility() != View.VISIBLE) continue;
-            String n = c.getClass().getName();
-            if (n.endsWith("PinView") || n.endsWith("PasswordView")
-                    || n.endsWith("PatternView") || n.contains("Bouncer")
-                    || n.contains("KeyInput") || n.contains("NumPad")) {
-                return true;
-            }
-            if (hasBouncerView(c, depth + 1)) return true;
-        }
-        return false;
-    }
-
-    /** 密码键盘界面：用模糊壁纸当背景（原生 bouncer 的观感） */
-    private void showBouncerBg() {
-        if (mView == null) return;
-        mBouncerBg = true;
-        try {
-            if (mAnim != null) {
-                try {
-                    mAnim.cancel();
-                } catch (Throwable ignored) {
-                }
-                mAnim = null;
-            }
-            mView.setBlur(80f);
-            mView.setMaskAlpha(0.60f);
-            mView.setScaleX(1f);
-            mView.setScaleY(1f);
-            mView.setAlpha(1f);
-            mView.setVisibility(View.VISIBLE);
-            mH.post(new Runnable() {
-                @Override
-                public void run() {
-                    placeBelowPanel();
-                }
-            });
-            hideAllClocks();
-            log("bouncer bg on (blur 80)");
-        } catch (Throwable t) {
-            log("bouncer bg fail " + t);
-        }
-    }
-
-    private void hideBouncerBg() {
-        if (!mBouncerBg) return;
-        mBouncerBg = false;
-        try {
-            if (mView != null) {
-                mView.setBlur(0f);
-                mView.setMaskAlpha(cfgMask);
-                mView.setAlpha(0f);
-                mView.setVisibility(View.GONE);
-            }
-            restoreClocks();
-            log("bouncer bg off");
-        } catch (Throwable ignored) {
-        }
-    }
-
-    private void clearRootDim() {
-        if (!mRootDimmed || mParent == null) return;
-        mRootDimmed = false;
-        try {
-            mParent.setBackground(mRootDimBg);
-            log("dim root off");
-        } catch (Throwable ignored) {
-        }
-        mRootDimBg = null;
-    }
-
-    private void ensureScrimForKeyguard() {
-        if (mAod || mIntervene) return;
-        if (mScrimController == null) return;
-        try {
-            String st = readScrimState();
-            boolean kd = st.indexOf("KEYGUARD") >= 0 || st.indexOf("BOUNCER") >= 0
-                    || st.indexOf("OCCLUDED") >= 0;
-            if (!kd) {
-                mScrimHeal = 0;
-                mScrimApplied = false;
-                return;
-            }
-            if (mScrimApplied) return;
-            View behind = null;
-            try {
-                Object o = XposedHelpers.getObjectField(mScrimController, "mScrimBehind");
-                if (o instanceof View) behind = (View) o;
-            } catch (Throwable ignored) {
-            }
-            mScrimApplied = true;
-            boolean ok = callApplyState();
-            if (!ok) restoreScrimAlphas();
-            log("heal scrim: state=" + st + " behind="
-                    + (behind == null ? "null" : String.valueOf(behind.getAlpha()))
-                    + " applyState=" + ok);
-            log("scrimview " + dumpScrim(behind));
-        } catch (Throwable t) {
-            log("heal scrim fail " + t);
-        }
-    }
-
-    /**
-     * 按当前 ScrimState 枚举自带的 alpha 值，直接写回三层 ScrimView。
-     * 不能用 applyAndDispatchState()：它用的是 ScrimController 内部缓存的
-     * mScrimBehindAlpha，而那个值在 AOD 期间已经被算成 0，重算只会再写一遍 0。
-     */
-    private void restoreScrimAlphas() {
-        if (mScrimController == null) return;
-        try {
-            Object cur = null;
-            try {
-                cur = XposedHelpers.getObjectField(mScrimController, "mState");
-            } catch (Throwable ignored) {
-            }
-            String st = cur == null ? "" : String.valueOf(cur);
-            if (st.indexOf("AOD") >= 0) return;
-
-            float ba = 0.5f, na = 0f, fa = 0f;
-            boolean fromState = false;
-            if (cur != null) {
-                try {
-                    ba = XposedHelpers.getFloatField(cur, "mBehindAlpha");
-                    fromState = true;
-                } catch (Throwable ignored) {
-                }
-                try {
-                    na = XposedHelpers.getFloatField(cur, "mNotifAlpha");
-                } catch (Throwable ignored) {
-                }
-                try {
-                    fa = XposedHelpers.getFloatField(cur, "mFrontAlpha");
-                } catch (Throwable ignored) {
-                }
-            }
-            int bb = readNum(cur, "mBehindBlurRadius");
-            int nb = readNum(cur, "mNotifBlurRadius");
-            int fb = readNum(cur, "mFrontBlurRadius");
-
-            setScrimAlpha("mScrimBehind", ba);
-            setScrimAlpha("mNotificationsScrim", na);
-            setScrimAlpha("mScrimInFront", fa);
-            setScrimBlur("mScrimBehind", bb);
-            setScrimBlur("mNotificationsScrim", nb);
-            setScrimBlur("mScrimInFront", fb);
-            if (ba > 0.01f) setScrimTint("mScrimBehind", 0xB3000000);
-            if (na > 0.01f) setScrimTint("mNotificationsScrim", 0xB3000000);
-            if (fa > 0.01f) setScrimTint("mScrimInFront", 0xB3000000);
-            if (!mScrimRestored) {
-                mScrimRestored = true;
-                log("restore scrim " + st + " alpha=" + ba + "/" + na + "/" + fa
-                        + " blur=" + bb + "/" + nb + "/" + fb
-                        + (fromState ? "" : " (fallback)"));
-            }
-        } catch (Throwable t) {
-            log("restore scrim fail " + t);
-        }
-    }
-
-    /**
-     * 让 ScrimController 按当前 mState 完整重算一遍。
-     * 这一步不仅重算 alpha，还会重设 ScrimView 的 tint 颜色与模糊半径；
-     * 只改 alpha 的话，颜色在 AOD 期间被改成透明的，恢复 alpha 也画不出东西。
-     */
-    private String dumpScrim(Object v) {
-        if (v == null) return "null";
-        StringBuilder sb = new StringBuilder(v.getClass().getSimpleName()).append("( ");
-        try {
-            sb.append("vis=").append(((View) v).getVisibility())
-                    .append(" w=").append(((View) v).getWidth())
-                    .append(" h=").append(((View) v).getHeight())
-                    .append(" a=").append(((View) v).getAlpha()).append(" ");
-        } catch (Throwable ignored) {
-        }
-        try {
-            Class<?> c = v.getClass();
-            int guard = 0;
-            while (c != null && c != Object.class && guard++ < 6) {
-                for (java.lang.reflect.Field f : c.getDeclaredFields()) {
-                    String n = f.getName();
-                    if (!(n.contains("lpha") || n.contains("int") || n.contains("lur")
-                            || n.contains("rawable"))) continue;
-                    try {
-                        f.setAccessible(true);
-                        Object val = f.get(v);
-                        if (val instanceof android.graphics.drawable.Drawable) {
-                            sb.append(n).append("=").append(val.getClass().getSimpleName());
-                            try {
-                                sb.append("[");
-                                Class<?> dc = val.getClass();
-                                int dg = 0;
-                                while (dc != null && dc != Object.class && dg++ < 4) {
-                                    for (java.lang.reflect.Field df : dc.getDeclaredFields()) {
-                                        try {
-                                            df.setAccessible(true);
-                                            Object dv = df.get(val);
-                                            if (dv instanceof int[]) {
-                                                int[] arr = (int[]) dv;
-                                                sb.append(df.getName()).append("=");
-                                                for (int i = 0; i < Math.min(arr.length, 6); i++) {
-                                                    sb.append(Integer.toHexString(arr[i])).append("|");
-                                                }
-                                            } else {
-                                                sb.append(df.getName()).append("=").append(dv);
-                                            }
-                                            sb.append(",");
-                                        } catch (Throwable ignored) {
-                                        }
-                                    }
-                                    dc = dc.getSuperclass();
-                                }
-                                sb.append("]");
-                            } catch (Throwable ignored) {
-                            }
-                            sb.append(" ");
-                        } else {
-                            sb.append(n).append("=").append(val).append(" ");
-                        }
-                    } catch (Throwable ignored) {
-                    }
-                }
-                c = c.getSuperclass();
-            }
-        } catch (Throwable t) {
-            sb.append("ERR");
-        }
-        return sb.append(")").toString();
-    }
-
-    private boolean callApplyState() {
-        for (String m : new String[]{"applyState", "applyScrimState"}) {
-            try {
-                XposedHelpers.callMethod(mScrimController, m);
-                return true;
-            } catch (Throwable ignored) {
-            }
-        }
-        return false;
-    }
-
-    private void setScrimTint(String field, int color) {
-        try {
-            Object o = XposedHelpers.getObjectField(mScrimController, field);
-            if (o == null) return;
-            XposedHelpers.callMethod(o, "setTint", color);
-        } catch (Throwable ignored) {
-        }
-    }
-
-    private int readNum(Object o, String field) {
-        if (o == null) return 0;
-        try {
-            Object v = XposedHelpers.getObjectField(o, field);
-            if (v instanceof Number) return ((Number) v).intValue();
-        } catch (Throwable ignored) {
-        }
-        return 0;
-    }
-
-    private void setScrimBlur(String field, int radius) {
-        if (radius <= 0) return;
-        try {
-            Object o = XposedHelpers.getObjectField(mScrimController, field);
-            if (o == null) return;
-            XposedHelpers.callMethod(o, "setBlurRadius", radius);
-        } catch (Throwable ignored) {
-        }
-    }
-
-    private void setScrimAlpha(String field, float a) {
-        try {
-            Object o = XposedHelpers.getObjectField(mScrimController, field);
-            if (o instanceof View) ((View) o).setAlpha(a);
-        } catch (Throwable ignored) {
-        }
-    }
-
-    private void applyScrimNow() {
-        if (mIntervene && mScrimController != null) applyScrim(mScrimController);
-    }
-
-    private void applyScrim(Object ctrl) {
-        try {
-            if (!mScrimCancelled) {
-                mScrimCancelled = true;
-                try {
-                    Object anim = XposedHelpers.getObjectField(ctrl, "mScrimAnimator");
-                    if (anim instanceof android.animation.Animator) {
-                        ((android.animation.Animator) anim).cancel();
-                    }
-                } catch (Throwable ignored) {
-                }
-            }
-            int cleared = 0;
-            StringBuilder info = new StringBuilder();
-            for (String f : new String[]{"mScrimBehind", "mNotificationsScrim", "mScrimInFront"}) {
-                try {
-                    Object o = XposedHelpers.getObjectField(ctrl, f);
-                    if (o instanceof View) {
-                        View v = (View) o;
-                        float a = v.getAlpha();
-                        if (a > 0.001f) {
-                            v.setAlpha(0f);
-                            cleared++;
-                        }
-                        info.append(f).append("=").append(a).append(" ");
-                    }
-                } catch (Throwable t) {
-                    info.append(f).append("=ERR ");
-                }
-            }
-            if (cleared > 0) log("scrim cleared " + cleared + " [" + info.toString().trim() + "]");
-        } catch (Throwable t) {
-            log("applyScrim fail: " + t);
-        }
-    }
-
-    /* ---------------- 姿态传感器（反扣关闭所有 AOD / 拿起自动亮屏） ---------------- */
-
-    private final SensorEventListener mPostureSensorListener = new SensorEventListener() {
-        @Override
-        public void onSensorChanged(SensorEvent event) {
-            if (event == null || event.sensor == null || event.values == null) return;
-            int type = event.sensor.getType();
-            long now = SystemClock.elapsedRealtime();
-
-            if (type == Sensor.TYPE_PROXIMITY) {
-                float dist = event.values[0];
-                float maxRange = event.sensor.getMaximumRange();
-                mProximityNear = (dist >= 0f && dist < Math.min(5f, maxRange));
-                return;
-            }
-
-            if (type != Sensor.TYPE_ACCELEROMETER || event.values.length < 3) return;
-            float ax = event.values[0];
-            float ay = event.values[1];
-            float az = event.values[2];
-
-            if (!mGravityInit) {
-                mGx = ax;
-                mGy = ay;
-                mGz = az;
-                mGravityInit = true;
-            } else {
-                mGx = 0.76f * mGx + 0.24f * ax;
-                mGy = 0.76f * mGy + 0.24f * ay;
-                mGz = 0.76f * mGz + 0.24f * az;
-            }
-
-            if (!mBaseGravityInit) {
-                mBaseGx = mGx;
-                mBaseGy = mGy;
-                mBaseGz = mGz;
-                mBaseGravityInit = true;
-            }
-
-            float normA = (float) Math.sqrt(ax * ax + ay * ay + az * az);
-            float linearAccel = Math.abs(normA - 9.81f);
-            if (linearAccel > 0.55f) {
-                mLastMotionTs = now;
-            }
-
-            // 1) 反扣检测：屏幕朝下水平放置时关闭所有 AOD（全屏壁纸 + 系统时钟），翻转朝上时恢复
-            if (cfgFlipOff && (!isScreenOn() || mAod || mFaceDownPaused)) {
-                double horiz = Math.hypot(mGx, mGy);
-                boolean isFlatFaceDown = (mGz < -7.2f) && (horiz < 4.6f);
-                boolean isFaceUpAgain = (mGz > -4.2f) || (horiz > 5.8f);
-
-                if (isFlatFaceDown) {
-                    mFaceUpSince = 0L;
-                    if (!mFaceDownPaused) {
-                        if (mFaceDownSince == 0L) {
-                            mFaceDownSince = now;
-                        } else if (now - mFaceDownSince >= 550L) {
-                            enterFaceDownAodOff();
-                        }
-                    }
-                } else {
-                    mFaceDownSince = 0L;
-                    if (mFaceDownPaused && isFaceUpAgain) {
-                        if (mFaceUpSince == 0L) {
-                            mFaceUpSince = now;
-                        } else if (now - mFaceUpSince >= 240L) {
-                            exitFaceDownAodResume();
-                        }
-                    } else {
-                        mFaceUpSince = 0L;
-                    }
-                }
-            }
-
-            // 2) 姿态检测：拿起手机并抬起朝向用户时自动亮屏
-            if (cfgLiftWake && !isScreenOn() && !mProximityNear && (now - mSensorStartElapsed >= 1400L)) {
-                boolean viewingTilt = (mGz > 1.2f && mGz < 9.0f)
-                        && (mGy > 2.75f || (Math.abs(mGx) > 3.4f && mGy > -1.0f));
-                float deltaPitch = mGy - mBaseGy;
-                float deltaVec = (float) Math.sqrt(
-                        (mGx - mBaseGx) * (mGx - mBaseGx)
-                                + (mGy - mBaseGy) * (mGy - mBaseGy)
-                                + (mGz - mBaseGz) * (mGz - mBaseGz));
-
-                if (viewingTilt && (deltaPitch > 2.15f || deltaVec > 3.1f)
-                        && (now - mLastMotionTs < 950L)
-                        && (now - mLastLiftWakeTs > 2500L)) {
-                    mLastLiftWakeTs = now;
-                    mBaseGx = mGx;
-                    mBaseGy = mGy;
-                    mBaseGz = mGz;
-                    wakeUpScreen("posture_lift");
-                    return;
-                }
-
-                // 当手机处于平放、反扣或静止低倾角状态时缓慢更新基准姿态
-                if (linearAccel < 0.40f && (mGz > 7.6f || mGz < -6.5f || mGy < 1.8f)) {
-                    mBaseGx = 0.85f * mBaseGx + 0.15f * mGx;
-                    mBaseGy = 0.85f * mBaseGy + 0.15f * mGy;
-                    mBaseGz = 0.85f * mBaseGz + 0.15f * mGz;
-                }
-            }
-        }
-
-        @Override
-        public void onAccuracyChanged(Sensor sensor, int accuracy) {
-        }
-    };
-
-    private final TriggerEventListener mPickupTriggerListener = new TriggerEventListener() {
-        @Override
-        public void onTrigger(TriggerEvent event) {
-            mPickupTriggerRegistered = false;
-            long now = SystemClock.elapsedRealtime();
-            if (cfgLiftWake && !isScreenOn() && !mProximityNear && !mFaceDownPaused
-                    && (now - mSensorStartElapsed >= 1400L)) {
-                wakeUpScreen("pickup_sensor");
-            } else {
-                updatePostureSensors();
-            }
-        }
-    };
-
     private void updatePostureSensors() {
-        if (mCtx == null) return;
-        boolean need = (!isScreenOn() || mAod || mFaceDownPaused) && (cfgFlipOff || cfgLiftWake);
-        try {
-            SensorManager sm = (SensorManager) mCtx.getSystemService(Context.SENSOR_SERVICE);
-            if (sm == null) return;
+        if (Looper.myLooper() != Looper.getMainLooper()) {
+            mH.post(this::updatePostureSensors);
+            return;
+        }
+        if (mCtx == null || mSm == null) return;
+        probeSensorsOnce();
 
-            if (need && !mSensorRegistered) {
-                Sensor accel = sm.getDefaultSensor(Sensor.TYPE_ACCELEROMETER, true);
-                if (accel == null) accel = sm.getDefaultSensor(Sensor.TYPE_ACCELEROMETER);
-                if (accel != null) {
-                    mGravityInit = false;
-                    mBaseGravityInit = false;
-                    mProximityNear = false;
-                    mFaceDownSince = 0L;
-                    mFaceUpSince = 0L;
-                    mSensorStartElapsed = SystemClock.elapsedRealtime();
-                    sm.registerListener(mPostureSensorListener, accel,
-                            SensorManager.SENSOR_DELAY_NORMAL, mH);
-                    mSensorRegistered = true;
-                }
-                Sensor prox = sm.getDefaultSensor(Sensor.TYPE_PROXIMITY, true);
-                if (prox == null) prox = sm.getDefaultSensor(Sensor.TYPE_PROXIMITY);
-                if (prox != null) {
-                    sm.registerListener(mPostureSensorListener, prox,
-                            SensorManager.SENSOR_DELAY_NORMAL, mH);
-                }
-                log("posture sensors registered (flipOff=" + cfgFlipOff + " liftWake=" + cfgLiftWake + ")");
-            } else if (!need && mSensorRegistered) {
-                sm.unregisterListener(mPostureSensorListener);
-                mSensorRegistered = false;
-                if (mPickupTriggerRegistered && mPickupSensor != null) {
-                    try {
-                        sm.cancelTriggerSensor(mPickupTriggerListener, mPickupSensor);
-                    } catch (Throwable ignored) {
-                    }
-                    mPickupTriggerRegistered = false;
-                }
-                releaseFaceDownWakeLock();
-                log("posture sensors unregistered");
-            }
+        boolean screenOn = isScreenOn();
+        boolean needPosture = cfgEnabled && (cfgFlipOff || cfgLiftWake) && (mDozing || !screenOn || mFaceDownPaused);
+        if (!needPosture) {
+            stopAllPostureSensors();
+            return;
+        }
 
-            // Hardware Wake-up Pick-Up Gesture Sensor (Type 25)
-            if (need && cfgLiftWake && !mPickupTriggerRegistered) {
-                if (mPickupSensor == null) {
-                    mPickupSensor = sm.getDefaultSensor(25); // TYPE_PICK_UP_GESTURE
-                }
-                if (mPickupSensor != null) {
-                    mPickupTriggerRegistered = sm.requestTriggerSensor(mPickupTriggerListener, mPickupSensor);
-                }
-            } else if ((!need || !cfgLiftWake) && mPickupTriggerRegistered && mPickupSensor != null) {
-                try {
-                    sm.cancelTriggerSensor(mPickupTriggerListener, mPickupSensor);
-                } catch (Throwable ignored) {
-                }
-                mPickupTriggerRegistered = false;
-            }
-        } catch (Throwable t) {
-            log("updatePostureSensors fail: " + t);
+        if (mProxSensor != null && !mProxRegistered) {
+            mProxRegistered = mSm.registerListener(mProxListener, mProxSensor, SensorManager.SENSOR_DELAY_NORMAL, mH);
+        }
+        if (mTiltSensor != null && !mTiltRegistered) {
+            mTiltRegistered = mSm.registerListener(mTiltListener, mTiltSensor, SensorManager.SENSOR_DELAY_NORMAL, mH);
+        }
+        armPickupTriggerIfNeeded();
+
+        if (!mInitialBurstDoneForOff && (cfgFlipOff || !mBaseGravityInit)) {
+            mInitialBurstDoneForOff = true;
+            mBaseGravityInit = false;
+            startAccelBurst(5000L, false);
         }
     }
 
-    private void acquireFaceDownWakeLock() {
+    private void stopAllPostureSensors() {
+        if (mSm == null) return;
+        if (mProxRegistered) {
+            mSm.unregisterListener(mProxListener);
+            mProxRegistered = false;
+        }
+        if (mTiltRegistered) {
+            mSm.unregisterListener(mTiltListener);
+            mTiltRegistered = false;
+        }
+        stopAccelBurst();
+        if (mPickupTriggerRegistered && mPickupSensor != null) {
+            try {
+                mSm.cancelTriggerSensor(mPickupTrigger, mPickupSensor);
+            } catch (Throwable ignored) {
+            }
+            mPickupTriggerRegistered = false;
+        }
+        releaseFaceDownWakeLock();
+    }
+
+    private void armPickupTriggerIfNeeded() {
+        if (mSm == null || mPickupSensor == null || mPickupTriggerRegistered) return;
+        if (!cfgEnabled || (!cfgLiftWake && !mFaceDownPaused)) return;
         try {
-            if (mCtx == null) return;
+            mPickupTriggerRegistered = mSm.requestTriggerSensor(mPickupTrigger, mPickupSensor);
+        } catch (Throwable ignored) {
+            mPickupTriggerRegistered = false;
+        }
+    }
+
+    private void startAccelBurst(long durationMs, boolean withShortWakeLock) {
+        if (mSm == null || mAccelSensor == null) return;
+        long now = SystemClock.elapsedRealtime();
+        mAccelStopAtElapsed = Math.max(mAccelStopAtElapsed, now + durationMs);
+        if (withShortWakeLock) {
+            acquireFaceDownWakeLock(Math.min(durationMs, BURST_WAKELOCK_MAX_MS));
+        }
+        if (!mAccelRegistered) {
+            mSensorStartElapsed = now;
+            mFaceDownSince = 0L;
+            mFaceUpSince = 0L;
+            mAccelRegistered = mSm.registerListener(mAccelListener, mAccelSensor, SensorManager.SENSOR_DELAY_NORMAL, mH);
+        }
+        mH.removeCallbacks(mAccelTimeoutRun);
+        mH.postDelayed(mAccelTimeoutRun, Math.max(500L, mAccelStopAtElapsed - now));
+    }
+
+    private void stopAccelBurst() {
+        mH.removeCallbacks(mAccelTimeoutRun);
+        if (mAccelRegistered && mSm != null) {
+            mSm.unregisterListener(mAccelListener);
+            mAccelRegistered = false;
+        }
+        releaseFaceDownWakeLock();
+    }
+
+    private final Runnable mAccelTimeoutRun = () -> {
+        long now = SystemClock.elapsedRealtime();
+        if (now >= mAccelStopAtElapsed) {
+            stopAccelBurst();
+        } else {
+            mH.postDelayed(this::stopAccelBurst, mAccelStopAtElapsed - now);
+        }
+    };
+
+    private void acquireFaceDownWakeLock(long timeoutMs) {
+        if (mPm == null) return;
+        try {
             if (mFaceDownWakeLock == null) {
-                PowerManager pm = (PowerManager) mCtx.getSystemService(Context.POWER_SERVICE);
-                if (pm != null) {
-                    mFaceDownWakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "SystemUI:FullAODFlip");
-                    mFaceDownWakeLock.setReferenceCounted(false);
-                }
+                mFaceDownWakeLock = mPm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, TAG + ":PostureBurst");
+                mFaceDownWakeLock.setReferenceCounted(false);
             }
-            if (mFaceDownWakeLock != null && !mFaceDownWakeLock.isHeld()) {
-                mFaceDownWakeLock.acquire(2 * 3600 * 1000L); // 最长 2 小时安全兜底
-            }
+            mFaceDownWakeLock.acquire(Math.max(500L, Math.min(timeoutMs, BURST_WAKELOCK_MAX_MS)));
         } catch (Throwable ignored) {
         }
     }
@@ -1616,135 +1862,313 @@ public final class AodController {
         }
     }
 
+    private final SensorEventListener mProxListener = new SensorEventListener() {
+        @Override
+        public void onSensorChanged(SensorEvent event) {
+            if (event == null || event.values == null || event.values.length == 0 || mProxSensor == null) return;
+            boolean near = event.values[0] < mProxSensor.getMaximumRange() && event.values[0] < 5.0f;
+            boolean prev = mProximityNear;
+            mProximityNear = near;
+            if (near != prev) {
+                if (near && cfgFlipOff && !mFaceDownPaused) {
+                    startAccelBurst(3000L, true);
+                } else if (!near && mFaceDownPaused) {
+                    startAccelBurst(2500L, true);
+                }
+            }
+        }
+
+        @Override
+        public void onAccuracyChanged(Sensor sensor, int accuracy) {
+        }
+    };
+
+    private final SensorEventListener mTiltListener = new SensorEventListener() {
+        @Override
+        public void onSensorChanged(SensorEvent event) {
+            if (!cfgEnabled || (!cfgFlipOff && !cfgLiftWake)) return;
+            startAccelBurst(2500L, true);
+        }
+
+        @Override
+        public void onAccuracyChanged(Sensor sensor, int accuracy) {
+        }
+    };
+
+    private final TriggerEventListener mPickupTrigger = new TriggerEventListener() {
+        @Override
+        public void onTrigger(TriggerEvent event) {
+            mPickupTriggerRegistered = false;
+            mH.post(() -> onPickupTriggeredMain());
+        }
+    };
+
+    private void onPickupTriggeredMain() {
+        if (!cfgEnabled || (!cfgLiftWake && !mFaceDownPaused)) {
+            return;
+        }
+        if (mProximityNear) {
+            log("pickup ignored (proximity near)");
+            mH.postDelayed(this::armPickupTriggerIfNeeded, 1000L);
+            return;
+        }
+        if (mFaceDownPaused) {
+            log("pickup while faceDownPaused -> burst verify orientation");
+            startAccelBurst(2500L, true);
+        } else if (cfgLiftWake && !isScreenOn()) {
+            wakeUpScreen("pickup");
+        }
+        mH.postDelayed(this::armPickupTriggerIfNeeded, 1000L);
+    }
+
+    private final SensorEventListener mAccelListener = new SensorEventListener() {
+        @Override
+        public void onSensorChanged(SensorEvent event) {
+            if (event == null || event.values == null || event.values.length < 3) return;
+            float ax = event.values[0];
+            float ay = event.values[1];
+            float az = event.values[2];
+
+            if (!mGravityInit) {
+                mGx = ax;
+                mGy = ay;
+                mGz = az;
+                mGravityInit = true;
+            } else {
+                mGx = 0.7f * mGx + 0.3f * ax;
+                mGy = 0.7f * mGy + 0.3f * ay;
+                mGz = 0.7f * mGz + 0.3f * az;
+            }
+            if (!mBaseGravityInit) {
+                mBaseGx = mGx;
+                mBaseGy = mGy;
+                mBaseGz = mGz;
+                mBaseGravityInit = true;
+            }
+
+            long now = SystemClock.elapsedRealtime();
+
+            // 1. Check face-down (flipOff)
+            if (cfgFlipOff && !mFaceDownPaused && mAod) {
+                boolean faceDown = mGz < -7.2f || (mProximityNear && mGz < -5.8f);
+                if (faceDown) {
+                    if (mFaceDownSince == 0L) mFaceDownSince = now;
+                    if (now - mFaceDownSince >= 750L) {
+                        enterFaceDownAodOff();
+                        stopAccelBurst();
+                        return;
+                    }
+                } else {
+                    mFaceDownSince = 0L;
+                }
+            }
+
+            // 2. Check face-up resume from face-down pause
+            if (mFaceDownPaused) {
+                boolean faceUp = mGz > 3.5f && !mProximityNear;
+                if (faceUp) {
+                    if (mFaceUpSince == 0L) mFaceUpSince = now;
+                    if (now - mFaceUpSince >= 250L) {
+                        exitFaceDownAodResume();
+                        if (cfgLiftWake && !isScreenOn() && !mProximityNear && Math.abs(mGy) > 3.5f) {
+                            wakeUpScreen("flip_lift");
+                        }
+                        stopAccelBurst();
+                        return;
+                    }
+                } else {
+                    mFaceUpSince = 0L;
+                }
+            }
+
+            // 3. Fallback tilt lift-to-wake when hardware pickup didn't fire (e.g. continuous hold lift)
+            if (cfgLiftWake && !mFaceDownPaused && !isScreenOn() && !mProximityNear
+                    && (now - mSensorStartElapsed > 350L)) {
+                float dot = mGx * mBaseGx + mGy * mBaseGy + mGz * mBaseGz;
+                float n1 = (float) Math.sqrt(mGx * mGx + mGy * mGy + mGz * mGz);
+                float n2 = (float) Math.sqrt(mBaseGx * mBaseGx + mBaseGy * mBaseGy + mBaseGz * mBaseGz);
+                if (n1 > 5f && n2 > 5f) {
+                    float cos = clampFloat(dot / (n1 * n2), -1f, 1f);
+                    double deg = Math.toDegrees(Math.acos(cos));
+                    if (deg >= 38.0 && Math.abs(mGy) > 4.5f && mGz > 1.5f) {
+                        wakeUpScreen("tilt_burst");
+                        stopAccelBurst();
+                    }
+                }
+            }
+        }
+
+        @Override
+        public void onAccuracyChanged(Sensor sensor, int accuracy) {
+        }
+    };
+
     private void enterFaceDownAodOff() {
         if (mFaceDownPaused) return;
         mFaceDownPaused = true;
-        acquireFaceDownWakeLock();
-        log("posture: face-down -> turn OFF all AOD (clock + wallpaper)");
-        try {
-            if (mIntervene) {
-                mIntervene = false;
-                mH.removeCallbacks(mShiftTask);
-                restoreOpaqueBackgrounds();
-                stopScrimKeeper();
-                restoreScrimAlphas();
-                animateTo(0f, cfgAnimOut);
-            } else if (mView != null) {
-                mView.setAlpha(0f);
-                mView.setVisibility(View.GONE);
-            }
-            hideAllClocks();
-            requestAodPaused();
-        } catch (Throwable t) {
-            log("enterFaceDownAodOff fail: " + t);
-        }
+        mFaceDownSince = SystemClock.elapsedRealtime();
+        mFaceUpSince = 0L;
+        log("enterFaceDownAodOff (keep system clock untouched!)");
+        animateTo(0f, Math.min(cfgAnimOut, 200));
+        stopTick();
+        mH.post(this::requestAodPaused);
+        armPickupTriggerIfNeeded();
     }
 
     private void exitFaceDownAodResume() {
         if (!mFaceDownPaused) return;
         mFaceDownPaused = false;
-        releaseFaceDownWakeLock();
-        log("posture: face-up -> resume AOD");
-        try {
-            restoreClocks();
-            requestAodResume();
-            if (!isScreenOn()) {
-                updateNightActive();
-                boolean shouldIntervene = cfgEnabled && !mNightActive && !mTimedOut;
-                if (shouldIntervene && mView != null) {
-                    mAod = true;
-                    mIntervene = true;
-                    mScrimCancelled = false;
-                    mView.setMaskAlpha(cfgMask);
-                    mView.setVisibility(View.VISIBLE);
-                    placeBelowPanel();
-                    clearOpaqueBackgrounds();
-                    startScrimKeeper();
-                    applyScrimNow();
-                    animateTo(1f, cfgAnimIn);
-                    kickShift();
-                }
-            }
-        } catch (Throwable t) {
-            log("exitFaceDownAodResume fail: " + t);
-        }
+        mFaceUpSince = SystemClock.elapsedRealtime();
+        log("exitFaceDownAodResume");
+        mH.post(this::requestAodResume);
+        applyAod(false);
     }
 
     private void wakeUpScreen(String reason) {
-        if (mCtx == null) return;
+        if (mPm == null || !cfgEnabled || !cfgLiftWake) return;
+        if (isScreenOn() || mProximityNear) return;
+        long now = SystemClock.elapsedRealtime();
+        if (now - mLastLiftWakeTs < 2000L) return;
+        mLastLiftWakeTs = now;
+        mLastMotionTs = now;
+
+        log("wakeUpScreen reason=" + reason);
         try {
-            if (mFaceDownPaused) {
-                mFaceDownPaused = false;
-                releaseFaceDownWakeLock();
-                restoreClocks();
-            }
-            PowerManager pm = (PowerManager) mCtx.getSystemService(Context.POWER_SERVICE);
-            if (pm == null || pm.isInteractive()) return;
-            log("posture: wakeUpScreen reason=" + reason);
-            boolean woke = false;
-            try {
-                XposedHelpers.callMethod(pm, "wakeUp", SystemClock.uptimeMillis(), 2, "fullaod:" + reason);
-                woke = true;
-            } catch (Throwable ignored) {
+            if (mWakeUpMethod == null) {
                 try {
-                    XposedHelpers.callMethod(pm, "wakeUp", SystemClock.uptimeMillis(), "fullaod:" + reason);
-                    woke = true;
-                } catch (Throwable ignored2) {
+                    mWakeUpMethod = PowerManager.class.getMethod("wakeUp", long.class, int.class, String.class);
+                    mWakeUpArgCount = 3;
+                } catch (Throwable e1) {
                     try {
-                        XposedHelpers.callMethod(pm, "wakeUp", SystemClock.uptimeMillis());
-                        woke = true;
-                    } catch (Throwable ignored3) {
+                        mWakeUpMethod = PowerManager.class.getMethod("wakeUp", long.class, String.class);
+                        mWakeUpArgCount = 2;
+                    } catch (Throwable e2) {
+                        mWakeUpMethod = PowerManager.class.getMethod("wakeUp", long.class);
+                        mWakeUpArgCount = 1;
                     }
                 }
             }
-            if (!woke) {
-                @SuppressWarnings("deprecation")
-                PowerManager.WakeLock wl = pm.newWakeLock(
-                        PowerManager.SCREEN_BRIGHT_WAKE_LOCK
-                                | PowerManager.ACQUIRE_CAUSES_WAKEUP
-                                | PowerManager.ON_AFTER_RELEASE,
-                        "SystemUI:FullAODLiftWake");
-                wl.acquire(120L);
+            long uptime = SystemClock.uptimeMillis();
+            if (mWakeUpArgCount == 3) {
+                mWakeUpMethod.invoke(mPm, uptime, 16, TAG + ":" + reason);
+            } else if (mWakeUpArgCount == 2) {
+                mWakeUpMethod.invoke(mPm, uptime, TAG + ":" + reason);
+            } else {
+                mWakeUpMethod.invoke(mPm, uptime);
             }
-        } catch (Throwable t) {
-            log("wakeUpScreen fail: " + t);
-        }
-    }
-
-    /* ---------------- 亮度 ---------------- */
-
-    public float onBrightness(float in) {
-        if (mFaceDownPaused) return 0f;
-        if (!mAod || !mIntervene) return in;
-        float max = in <= 1.0f ? 1.0f : 255.0f;
-        float out = in * cfgBright;
-        if (out > max) out = max;
-        if (out < 0f) out = 0f;
-        return out;
-    }
-
-    public int onBrightnessInt(int in) {
-        if (mFaceDownPaused) return 0;
-        if (!mAod || !mIntervene) return in;
-        int out = Math.round(in * cfgBright);
-        if (out > 255) out = 255;
-        if (out < 0) out = 0;
-        return out;
-    }
-
-    /* ---------------- 日志 ---------------- */
-
-    public void log(String s) {
-        XposedBridge.log("FullAOD: " + s);
-        try {
-            if (mCtx == null) return;
-            File f = new File(mCtx.getFilesDir(), "fullaod.log");
-            if (f.length() > 300000L) f.delete();
-            FileOutputStream fo = new FileOutputStream(f, true);
-            String line = new SimpleDateFormat("MM-dd HH:mm:ss").format(new Date()) + " " + s + "\n";
-            fo.write(line.getBytes("UTF-8"));
-            fo.close();
+            return;
         } catch (Throwable ignored) {
         }
+
+        try {
+            @SuppressWarnings("deprecation")
+            PowerManager.WakeLock wl = mPm.newWakeLock(
+                    PowerManager.FULL_WAKE_LOCK
+                            | PowerManager.ACQUIRE_CAUSES_WAKEUP
+                            | PowerManager.ON_AFTER_RELEASE,
+                    TAG + ":LiftWake");
+            wl.acquire(1000L);
+            wl.release();
+        } catch (Throwable t) {
+            log("wakeUpScreen fallback err: " + t);
+        }
+    }
+
+    private boolean isScreenOn() {
+        if (mPm == null) return true;
+        try {
+            return mPm.isInteractive();
+        } catch (Throwable t) {
+            return true;
+        }
+    }
+
+    private float readScrimFloat(Object sc, String field) {
+        try {
+            return XposedHelpers.getFloatField(sc, field);
+        } catch (Throwable t) {
+            return 0f;
+        }
+    }
+
+    private float readScrimViewAlpha(Object sc, String field) {
+        try {
+            Object v = XposedHelpers.getObjectField(sc, field);
+            if (v instanceof View) return ((View) v).getAlpha();
+        } catch (Throwable ignored) {
+        }
+        return 0f;
+    }
+
+    private void runOnMain(Runnable r) {
+        if (Looper.myLooper() == Looper.getMainLooper()) {
+            r.run();
+        } else {
+            mH.post(r);
+        }
+    }
+
+    private void loadBaseWallpaperScale() {
+        try {
+            android.content.res.Resources sys = android.content.res.Resources.getSystem();
+            int id = sys.getIdentifier("config_wallpaperMaxScale", "dimen", "android");
+            if (id != 0) {
+                android.util.TypedValue tv = new android.util.TypedValue();
+                sys.getValue(id, tv, true);
+                float v = (tv.type == android.util.TypedValue.TYPE_FLOAT)
+                        ? tv.getFloat()
+                        : sys.getFloat(id);
+                if (!Float.isNaN(v) && v >= 1.0f && v <= 2.0f) {
+                    if (Math.abs(mBaseWallpaperScale - v) > 0.0005f) {
+                        log("baseWallpaperScale=" + v);
+                    }
+                    mBaseWallpaperScale = v;
+                    return;
+                }
+            }
+        } catch (Throwable t) {
+            log("loadBaseWallpaperScale err: " + t);
+        }
+        mBaseWallpaperScale = 1.0f;
+    }
+
+    private float getTargetWallpaperScale() {
+        return mBaseWallpaperScale * cfgScale;
+    }
+
+    private float lerpWallpaperScale(float v) {
+        return mBaseWallpaperScale * (1f + (cfgScale - 1f) * v);
+    }
+
+    private void applyViewScale(float s) {
+        if (mView != null) {
+            mView.setScaleX(s);
+            mView.setScaleY(s);
+        }
+    }
+
+    private void ensureLockscreenCenterOffset() {
+        if (mCtx == null || mRoot == null) return;
+        try {
+            if (!mRoot.isAttachedToWindow()) return;
+            android.os.IBinder tok = mRoot.getWindowToken();
+            if (tok == null || !tok.isBinderAlive()) return;
+            boolean isRtl = mRoot.getLayoutDirection() == View.LAYOUT_DIRECTION_RTL;
+            android.app.WallpaperManager wm = android.app.WallpaperManager.getInstance(mCtx);
+            if (wm != null) {
+                wm.setWallpaperOffsetSteps(0.0f, 1.0f);
+                wm.setWallpaperOffsets(tok, isRtl ? 1.0f : 0.0f, 0.5f);
+            }
+        } catch (Throwable ignored) {
+        }
+    }
+
+    private static float clampFloat(float v, float min, float max) {
+        if (Float.isNaN(v)) return min;
+        return Math.max(min, Math.min(max, v));
+    }
+
+    private static int clampInt(int v, int min, int max) {
+        return Math.max(min, Math.min(max, v));
     }
 }

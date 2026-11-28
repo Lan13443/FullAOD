@@ -18,7 +18,7 @@ SystemUI 内的 `AodController.refreshConfig()` 每 **3 秒**读一次，解析�
 | `nightEnd` | int | 0 – 23 | `7` | 夜间结束整点（支持跨零点） |
 | `animIn` | int | 150 – 1500 | `550` | 熄屏淡入+放大时长 ms |
 | `animOut` | int | 100 – 1000 | `350` | 亮屏淡出时长 ms |
-| `scale` | double | 1.00 – 1.10 | `1.03` | AOD 壁纸放大倍率 |
+| `scale` | double | 1.00 – 1.10 | `1.03` | AOD 壁纸相对倍率（`AodController` 会叠加系统 `config_wallpaperMaxScale`，例如 K60 为 `1.1`，故 `scale=1.0` 时与锁屏静态 `1.1x` 对齐；`WallpaperAodView` 水平裁切按 LTR `0` / RTL `bw - cropW` 与桌面/锁屏起始框选对齐） |
 | `shade` | bool | true/false | `false` | 锁屏/通知栏透出壁纸（**当前线上永久关闭，勿在 UI 上默认打开**） |
 | `shadeMask` | double | 0 – 0.95 | `0.80` | 通知栏遮罩浓度，仅 `shade=true` 生效 |
 | `aodTimeoutOn` | bool | true/false | `false` | 长期亮屏自动退化总开关 |
