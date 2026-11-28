@@ -30,17 +30,20 @@ MainActivity
 - **当前熄屏渲染策略概览卡片**：汇总显示当前暗化、亮度与夜间退化状态，点击直达壁纸预览二级页。
 
 ### 2.2 设置详情页（Tab 1，参考图 3 排版）
-保留原有全部 17 项配置，优化功能文案说明并拆分为清晰分组卡片与二级菜单：
+完整覆盖全部 22 项配置，优化功能文案说明并拆分为清晰分组卡片与二级菜单：
 1. **显示与动效**
-   - `壁纸显示与亮度`（二级菜单 `>`）：内含 **`WallpaperAodView` 实时壁纸暗化预览卡片**、`壁纸暗化程度 (mask 0–95%)`、`AOD 亮度倍数 (bright 100–300%)`、`放大倍率 (scale 100–110%)`。
+   - `壁纸显示与亮度`（二级菜单 `>`）：内含 **`WallpaperAodView` 实时壁纸与环境光状态栏预览卡片**（打开页内实时监听 `TYPE_LIGHT` 展示 lux → 硬件亮度与动态遮罩变化）、**环境光自动亮度卡片**（`autoBright` 开关 + `最低/最高硬件亮度 (autoBrightMin 1–50%, autoBrightMax 20–100%)` 防交叉滑块）、**视觉参数卡片**（`壁纸暗化程度 (mask 0–95%)`、`AOD 亮度倍数（手动模式）(bright 100–300%)` 开启自动时置灰、`放大倍率 (scale 100–110%)`）。
    - `过渡动画时长`（二级菜单 `>`）：`熄屏过渡时长 (animIn 150–1500 ms)`、`亮屏过渡时长 (animOut 100–1000 ms)`。
    - `像素位移防烧屏`（直接开关）：`shift`（每 90 秒 ±3px 周期微移）。
-2. **省电与退化策略**
+2. **姿态与智能感应**
+   - `反扣手机自动关闭所有 AOD`（`flipOff`）：屏幕朝下放置自动关闭全部 AOD（壁纸与系统时钟），正放后自动恢复。
+   - `拿起手机自动亮屏`（`liftWake`）：通过姿态倾角与硬件 Pick-up 自动点亮锁屏。
+3. **省电与退化策略**
    - `夜间自动退化`（二级菜单 `>`）：`启用夜间退化 (night)` 总开关（联动禁用子项）、`夜间开始 (nightStart 0–23)` 与 `夜间结束 (nightEnd 0–23)`（支持滑块 + `TimePickerDialog` 弹窗 + 同时间预警）、`夜间退化方式 (nightMode 0/1)`、`智能模式 (nightSmart)`。
    - `长期亮屏自动退化`（二级菜单 `>`）：`启用超时退化 (aodTimeoutOn)` 总开关（联动禁用子项）、`等待时间 (aodTimeoutMin 5–180 分钟)`、`退化方式 (aodTimeoutMode 0/1)`。
-3. **锁屏与通知栏**
+4. **锁屏与通知栏**
    - `锁屏与通知栏透出壁纸`（二级菜单 `>`）：`锁屏/通知栏透出壁纸 (shade)`、`通知栏遮罩 (shadeMask 0–95%)`。
-4. **界面（参考图 3、图 4、图 5）**
+5. **界面（参考图 3、图 4、图 5）**
    - `主题`（二级菜单 `>`）：
      - 顶部实时手机线框预览卡片（`ThemeMockupView`）
      - `跟随系统` | `浅色` | `深色` 三段切换
@@ -49,11 +52,11 @@ MainActivity
      - `预测性返回手势`（Android 14 `OnBackAnimationCallback`）、`横移返回手势`、`页面切换手势`（`跨轴拦截` / `自由滑动` / `关闭`）
    - `隐藏桌面图标`：通过 `<activity-alias android:name=".LauncherActivity">` 动态切换桌面图标显隐，隐藏后仍可从 LSPosed 模块列表正常打开 `MainActivity`。
    - `固定快捷图标到桌面`：通过 `ShortcutManager.requestPinShortcut` 主动向桌面添加图标。
-5. **调试与数据管理**
+6. **调试与数据管理**
    - `当前生效配置与救援说明`、`导出设置`、`导入设置`、`恢复默认值`（带 `AlertDialog` 二次确认）。
 
 ## 3. 数据流与首启同步保障
 
-- **首启导入**：`onCreate()` 启动时若 `SharedPreferences("fullaod")` 未初始化，自动从 `Settings.Secure.getString(cr, "fullaod_cfg")` 导入全部 17 个字段，防止覆盖线上 `nightMode=1` / `nightSmart=true` 配置。
-- **UI 偏好隔离**：前端主题与手势配置独立存储在 `SharedPreferences("fullaod_ui")`，与 17 项后端配置完全解耦。
-- **双写约定**：所有 AOD 控件变更均先写 `SharedPreferences("fullaod")` 再调用 `pushToSettings()` 全量写入 17 个 JSON 字段（含 `mask/bright/scale/shadeMask` 的 `/ 100.0` 换算）。
+- **首启导入**：`onCreate()` 启动时若 `SharedPreferences("fullaod")` 未初始化，自动从 `Settings.Secure.getString(cr, "fullaod_cfg")` 导入全部 22 个字段，防止覆盖线上 `nightMode=1` / `nightSmart=true` 配置。
+- **UI 偏好隔离**：前端主题与手势配置独立存储在 `SharedPreferences("fullaod_ui")`，与 22 项后端配置完全解耦。
+- **双写约定**：所有 AOD 控件变更均先写 `SharedPreferences("fullaod")` 再调用 `pushToSettings()` 全量写入 22 个 JSON 字段（含 `mask/bright/scale/shadeMask` 的 `/ 100.0` 换算）。

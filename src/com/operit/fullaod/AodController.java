@@ -65,6 +65,11 @@ public class AodController {
     private static final long SCRIM_KEEPER_INTERVAL_MS = 120L;
     private static final int SCRIM_KEEPER_MAX_TICKS = 10;
     private static final long BURST_WAKELOCK_MAX_MS = 3000L;
+    private static final float LIGHT_DEADBAND_NORM = 0.045f;
+    private static final long LIGHT_DEBOUNCE_BRIGHTEN_MS = 180L;
+    private static final long LIGHT_DEBOUNCE_DARKEN_MS = 1200L;
+    private static final long LIGHT_WAKELOCK_MAX_MS = 2500L;
+    private static final long LIGHT_STALE_REREGISTER_MS = 45000L;
     private static final long LOG_MAX_BYTES = 128L * 1024L;
     private static final int LOG_KEEP_TAIL_BYTES = 32 * 1024;
 
@@ -93,6 +98,7 @@ public class AodController {
     private Object mBrightnessForwarder;
     private Object mDozeService;
     private int mLastRawBrightnessInt = -1;
+    private float mLastRawBrightnessFloat = -1f;
     private int mLastAppliedBrightnessInt = -1;
     private int mLastLogRaw = -1;
     private int mLastLogOut = -1;
@@ -124,6 +130,9 @@ public class AodController {
     private boolean cfgNightSmart = false;
     private boolean cfgFlipOff = true;
     private boolean cfgLiftWake = true;
+    private boolean cfgAutoBright = true;
+    private int cfgAutoBrightMin = 4;
+    private int cfgAutoBrightMax = 75;
 
     private boolean mCfgLoaded = false;
     private long mLastCfgReadTs = 0L;
@@ -162,18 +171,37 @@ public class AodController {
     private boolean mScrimKeeperRunning = false;
     private int mScrimKeeperTicks = 0;
 
-    // Posture sensors
+    // Posture sensors & ambient light sensor
     private SensorManager mSm;
     private Sensor mProxSensor;
     private Sensor mAccelSensor;
     private Sensor mTiltSensor;
     private Sensor mPickupSensor;
+    private Sensor mLightSensor;
     private boolean mSensorsProbed = false;
     private boolean mProxRegistered = false;
     private boolean mTiltRegistered = false;
     private boolean mAccelRegistered = false;
     private boolean mPickupTriggerRegistered = false;
+    private boolean mLightRegistered = false;
     private boolean mInitialBurstDoneForOff = false;
+
+    private boolean mHasAppliedLight = false;
+    private boolean mForceImmediateAnimatedLight = false;
+    private float mRawLightLux = -1f;
+    private float mAppliedLightLux = -1f;
+    private float mAppliedLightNorm = -1f;
+    private long mLastLightEventTs = 0L;
+    private boolean mPendingLuxActive = false;
+    private float mPendingLux = -1f;
+    private int mPendingLuxDir = 0;
+    private long mPendingLuxDueTs = 0L;
+    private int mAutoBrightTargetInt = -1;
+    private float mAutoBrightTargetFloat = -1f;
+    private float mCurrentAnimHwFloat = -1f;
+    private float mCurrentIdealMask = -1f;
+    private float mCurrentAutoMask = -1f;
+    private ValueAnimator mAutoBrightAnim;
 
     private boolean mProximityNear = false;
     private boolean mFaceDownPaused = false;
@@ -194,6 +222,7 @@ public class AodController {
 
     private PowerManager mPm;
     private PowerManager.WakeLock mFaceDownWakeLock;
+    private PowerManager.WakeLock mAutoLightWakeLock;
     private Method mApplyStateMethod;
     private boolean mApplyStateMethodResolved = false;
     private Method mWakeUpMethod;
@@ -361,6 +390,7 @@ public class AodController {
             f.addAction(Intent.ACTION_SCREEN_ON);
             f.addAction(Intent.ACTION_SCREEN_OFF);
             f.addAction(Intent.ACTION_USER_PRESENT);
+            f.addAction(Intent.ACTION_TIME_TICK);
             BroadcastReceiver rx = new BroadcastReceiver() {
                 @Override
                 public void onReceive(Context context, Intent intent) {
@@ -379,6 +409,8 @@ public class AodController {
                         onScreenOnEvent();
                     } else if (Intent.ACTION_USER_PRESENT.equals(act)) {
                         onUserPresentEvent();
+                    } else if (Intent.ACTION_TIME_TICK.equals(act)) {
+                        onTimeTickEvent();
                     }
                 }
             };
@@ -401,6 +433,18 @@ public class AodController {
         updateNightActive();
         if (mAod) {
             applyAod(true);
+            if (isWallpaperAodVisible() && cfgAutoBright && mHasAppliedLight) {
+                commitAutoBrightness(mAppliedLightLux, false);
+            } else if (isWallpaperAodVisible() && !cfgAutoBright && mView != null) {
+                cancelAutoBrightAnim();
+                mCurrentAutoMask = -1f;
+                mCurrentIdealMask = -1f;
+                mCurrentAnimHwFloat = -1f;
+                mForceImmediateAnimatedLight = false;
+                releaseAutoLightWakeLock();
+                mView.setMaskAlpha(cfgMask);
+                syncDozeBrightness(true);
+            }
         } else if (mBouncerBg) {
             if (!cfgEnabled) {
                 hideBouncerBg();
@@ -411,6 +455,7 @@ public class AodController {
             }
         }
         updatePostureSensors();
+        updateLightSensor();
     }
 
     public void refreshConfig() {
@@ -466,6 +511,12 @@ public class AodController {
             cfgNightSmart = o.optBoolean("nightSmart", false);
             cfgFlipOff = o.optBoolean("flipOff", true);
             cfgLiftWake = o.optBoolean("liftWake", true);
+            cfgAutoBright = o.optBoolean("autoBright", true);
+            cfgAutoBrightMin = clampInt(o.optInt("autoBrightMin", 4), 1, 50);
+            cfgAutoBrightMax = clampInt(o.optInt("autoBrightMax", 75), 20, 100);
+            if (cfgAutoBrightMax < cfgAutoBrightMin) {
+                cfgAutoBrightMax = cfgAutoBrightMin;
+            }
             mCfgLoaded = true;
         } catch (Throwable t) {
             log("parse cfg err: " + t);
@@ -516,35 +567,94 @@ public class AodController {
             return orig;
         }
         mLastRawBrightnessInt = orig;
-        int out = (isAodBrightnessEligible() && Math.abs(cfgBright - 1.0f) >= 0.01f)
-                ? clampInt(Math.round(orig * cfgBright), 1, 255)
-                : orig;
+        int out = orig;
+        if (isAodBrightnessEligible()) {
+            if (cfgAutoBright) {
+                if (mAutoBrightAnim != null && mCurrentAnimHwFloat >= 1f) {
+                    out = clampInt(Math.round(mCurrentAnimHwFloat), 1, 255);
+                } else if (mAutoBrightTargetInt > 0) {
+                    out = mAutoBrightTargetInt;
+                }
+            } else if (Math.abs(cfgBright - 1.0f) >= 0.01f) {
+                out = clampInt(Math.round(orig * cfgBright), 1, 255);
+            }
+        }
         mLastAppliedBrightnessInt = out;
         if (orig != mLastLogRaw || out != mLastLogOut) {
             mLastLogRaw = orig;
             mLastLogOut = out;
-            log("brightness: raw=" + orig + " -> out=" + out + " (cfgBright=" + cfgBright + ")");
+            log("brightness: raw=" + orig + " -> out=" + out
+                    + (cfgAutoBright ? " (auto lux=" + (mHasAppliedLight ? AmbientLightCurve.formatLux(mAppliedLightLux) : "pending") + ")"
+                    : " (cfgBright=" + cfgBright + ")"));
         }
         return out;
     }
 
-    private void syncDozeBrightness(boolean scaled) {
-        if (mLastRawBrightnessInt <= 0) return;
-        int target = (scaled && Math.abs(cfgBright - 1.0f) >= 0.01f)
-                ? clampInt(Math.round(mLastRawBrightnessInt * cfgBright), 1, 255)
-                : mLastRawBrightnessInt;
-        if (target == mLastAppliedBrightnessInt) return;
+    private void pushDozeBrightnessInt(int targetInt) {
+        int clamped = clampInt(targetInt, 1, 255);
+        if (clamped == mLastAppliedBrightnessInt) return;
         Object host = mBrightnessForwarder != null ? mBrightnessForwarder : mDozeService;
         if (host == null) return;
         mPushingBrightness = true;
         try {
-            XposedHelpers.callMethod(host, "setDozeScreenBrightness", target);
-            mLastAppliedBrightnessInt = target;
-            log("brightness sync: raw=" + mLastRawBrightnessInt + " -> target=" + target);
-        } catch (Throwable t) {
-            log("brightness sync err: " + t);
+            if (mLastRawBrightnessFloat > 0f && mLastRawBrightnessInt <= 0) {
+                try {
+                    XposedHelpers.callMethod(host, "setDozeScreenBrightnessFloat",
+                            clampFloat(clamped / 255f, 0.004f, 1.0f));
+                    mLastAppliedBrightnessInt = clamped;
+                    return;
+                } catch (Throwable ignored) {
+                }
+            }
+            XposedHelpers.callMethod(host, "setDozeScreenBrightness", clamped);
+            mLastAppliedBrightnessInt = clamped;
+        } catch (Throwable t1) {
+            try {
+                XposedHelpers.callMethod(host, "setDozeScreenBrightnessFloat",
+                        clampFloat(clamped / 255f, 0.004f, 1.0f));
+                mLastAppliedBrightnessInt = clamped;
+            } catch (Throwable t2) {
+                log("brightness push err: " + t1);
+            }
         } finally {
             mPushingBrightness = false;
+        }
+    }
+
+    private void syncDozeBrightness(boolean scaled) {
+        if (!scaled) {
+            cancelAutoBrightAnim();
+            if (mLastRawBrightnessInt > 0 && mLastRawBrightnessInt != mLastAppliedBrightnessInt) {
+                pushDozeBrightnessInt(mLastRawBrightnessInt);
+                log("brightness restore: raw=" + mLastRawBrightnessInt);
+            } else if (mLastRawBrightnessFloat > 0f && mLastRawBrightnessInt <= 0) {
+                Object host = mBrightnessForwarder != null ? mBrightnessForwarder : mDozeService;
+                if (host != null) {
+                    mPushingBrightness = true;
+                    try {
+                        XposedHelpers.callMethod(host, "setDozeScreenBrightnessFloat", mLastRawBrightnessFloat);
+                        mLastAppliedBrightnessInt = -1;
+                    } catch (Throwable ignored) {
+                    } finally {
+                        mPushingBrightness = false;
+                    }
+                }
+            }
+            return;
+        }
+        if (cfgAutoBright) {
+            if (mAutoBrightAnim == null && mAutoBrightTargetInt > 0 && isAodBrightnessEligible()) {
+                pushDozeBrightnessInt(mAutoBrightTargetInt);
+            }
+            return;
+        }
+        if (mLastRawBrightnessInt <= 0) return;
+        int target = (Math.abs(cfgBright - 1.0f) >= 0.01f)
+                ? clampInt(Math.round(mLastRawBrightnessInt * cfgBright), 1, 255)
+                : mLastRawBrightnessInt;
+        if (target != mLastAppliedBrightnessInt) {
+            pushDozeBrightnessInt(target);
+            log("brightness sync: raw=" + mLastRawBrightnessInt + " -> target=" + target);
         }
     }
 
@@ -559,7 +669,22 @@ public class AodController {
         if (fromDream && mBrightnessForwarder != null) {
             return orig;
         }
+        if (orig <= 1.0f) {
+            mLastRawBrightnessFloat = orig;
+        }
         if (!isAodBrightnessEligible()) {
+            return orig;
+        }
+        if (cfgAutoBright) {
+            if (mAutoBrightAnim != null && mCurrentAnimHwFloat >= 1f) {
+                int animInt = clampInt(Math.round(mCurrentAnimHwFloat), 1, 255);
+                mLastAppliedBrightnessInt = animInt;
+                return (orig <= 1.0f) ? clampFloat(mCurrentAnimHwFloat / 255f, 0.004f, 1.0f) : (float) animInt;
+            }
+            if (mAutoBrightTargetInt > 0) {
+                mLastAppliedBrightnessInt = mAutoBrightTargetInt;
+                return (orig <= 1.0f) ? mAutoBrightTargetFloat : (float) mAutoBrightTargetInt;
+            }
             return orig;
         }
         if (Math.abs(cfgBright - 1.0f) < 0.01f) {
@@ -605,9 +730,23 @@ public class AodController {
             mInitialBurstDoneForOff = false;
             if ("FINISH".equals(s) || "UNINITIALIZED".equals(s)) {
                 mLastRawBrightnessInt = -1;
+                mLastRawBrightnessFloat = -1f;
                 mLastAppliedBrightnessInt = -1;
                 mLastLogRaw = -1;
                 mLastLogOut = -1;
+                mHasAppliedLight = false;
+                mForceImmediateAnimatedLight = false;
+                mAppliedLightLux = -1f;
+                mAppliedLightNorm = -1f;
+                mAutoBrightTargetInt = -1;
+                mAutoBrightTargetFloat = -1f;
+                mCurrentAnimHwFloat = -1f;
+                mCurrentIdealMask = -1f;
+                mCurrentAutoMask = -1f;
+                mPendingLuxActive = false;
+                mH.removeCallbacks(mLightDebounceRun);
+                cancelAutoBrightAnim();
+                releaseAutoLightWakeLock();
             }
         }
 
@@ -639,6 +778,7 @@ public class AodController {
             applyAod(false);
         }
         updatePostureSensors();
+        updateLightSensor();
     }
 
     private void onScreenOffEvent() {
@@ -652,6 +792,7 @@ public class AodController {
         mFaceUpSince = 0L;
         mInitialBurstDoneForOff = false;
         updatePostureSensors();
+        updateLightSensor();
     }
 
     private void onUserPresentEvent() {
@@ -674,7 +815,21 @@ public class AodController {
         }
         hideBouncerBg();
         updatePostureSensors();
+        updateLightSensor();
         stopTick();
+    }
+
+    private void onTimeTickEvent() {
+        if (!isWallpaperAodVisible()) return;
+        updateNightActive();
+        checkAodTimeout();
+        if (!isWallpaperAodVisible()) {
+            applyAod(false);
+            return;
+        }
+        if (cfgAutoBright) {
+            onLightTickCheck();
+        }
     }
 
     private boolean isInMorningTail(Calendar cal, int ns, int ne) {
@@ -768,6 +923,9 @@ public class AodController {
                     + " alpha=" + mView.getAlpha()
                     + " scale=" + mView.getScaleX()
                     + " mask=" + cfgMask
+                    + " effMask=" + getEffectiveAodMask()
+                    + " autoBright=" + cfgAutoBright
+                    + " lux=" + (mHasAppliedLight ? AmbientLightCurve.formatLux(mAppliedLightLux) : "pending")
                     + " bright=" + mLastRawBrightnessInt + "/" + mLastAppliedBrightnessInt
                     + " vis=" + mView.getVisibility()
                     + " idx=" + idx + " panel=" + panelIdx
@@ -779,6 +937,7 @@ public class AodController {
     private void applyAodTimeout() {
         mH.removeCallbacks(mAodSettleRun);
         mH.removeCallbacks(mDiagRun);
+        updateLightSensor();
         if (cfgTimeoutMode == 1) {
             animateTo(0f, cfgAnimOut);
             restoreOpaqueBackgrounds();
@@ -795,12 +954,17 @@ public class AodController {
     private void degradeToClockOnly() {
         mH.removeCallbacks(mAodSettleRun);
         mH.removeCallbacks(mDiagRun);
+        updateLightSensor();
         syncDozeBrightness(false);
         animateTo(0f, cfgAnimOut);
         restoreOpaqueBackgrounds();
         restoreClocks();
         restoreScrimAlphas();
         stopScrimKeeper();
+    }
+
+    private float getEffectiveAodMask() {
+        return (cfgAutoBright && mCurrentAutoMask >= 0f) ? mCurrentAutoMask : cfgMask;
     }
 
     private boolean isWallpaperAodVisible() {
@@ -825,7 +989,7 @@ public class AodController {
             mH.post(this::placeBelowPanel);
             clearOpaqueBackgrounds();
             mView.setBlur(0f);
-            mView.setMaskAlpha(cfgMask);
+            mView.setMaskAlpha(getEffectiveAodMask());
             if (cfgShift) {
                 kickShift();
             } else {
@@ -839,6 +1003,7 @@ public class AodController {
             }
             animateTo(1.0f, cfgAnimIn);
             applyScrimNow();
+            updateLightSensor();
             syncDozeBrightness(true);
             startScrimKeeper();
             startTick();
@@ -851,6 +1016,7 @@ public class AodController {
 
         mH.removeCallbacks(mAodSettleRun);
         mH.removeCallbacks(mDiagRun);
+        updateLightSensor();
 
         if (mAod && mFaceDownPaused) {
             animateTo(0f, Math.min(cfgAnimOut, 200));
@@ -1665,6 +1831,7 @@ public class AodController {
         } else if (isWallpaperAodVisible()) {
             if (cfgShift) kickShift();
             applyScrimNow();
+            if (cfgAutoBright) onLightTickCheck();
         } else if (mAod) {
             applyAodInner(false);
         }
@@ -1716,9 +1883,12 @@ public class AodController {
             mAccelSensor = mSm.getDefaultSensor(Sensor.TYPE_ACCELEROMETER);
             mTiltSensor = findWakeupSensorByType(SENSOR_TYPE_TILT_DETECTOR);
             mPickupSensor = findWakeupSensorByType(SENSOR_TYPE_PICK_UP_GESTURE);
+            mLightSensor = findWakeupSensorByType(Sensor.TYPE_LIGHT);
             log("sensors probed: prox=" + (mProxSensor != null ? mProxSensor.getName() : "none")
                     + " tilt=" + (mTiltSensor != null ? mTiltSensor.getName() : "none")
                     + " pickup=" + (mPickupSensor != null ? mPickupSensor.getName() : "none")
+                    + " light=" + (mLightSensor != null
+                    ? (mLightSensor.getName() + " wakeup=" + mLightSensor.isWakeUpSensor()) : "none")
                     + " accel=" + (mAccelSensor != null ? mAccelSensor.getName() : "none"));
         } catch (Throwable t) {
             log("probeSensors err: " + t);
@@ -1755,14 +1925,22 @@ public class AodController {
 
         boolean screenOn = isScreenOn();
         boolean needPosture = cfgEnabled && (cfgFlipOff || cfgLiftWake) && (mDozing || !screenOn || mFaceDownPaused);
+        boolean needProxForLight = cfgEnabled && cfgAutoBright && isWallpaperAodVisible();
+        boolean needProx = needPosture || needProxForLight;
+
+        if (mProxSensor != null && needProx && !mProxRegistered) {
+            mProxRegistered = mSm.registerListener(mProxListener, mProxSensor, SensorManager.SENSOR_DELAY_NORMAL, mH);
+        } else if (!needProx && mProxRegistered) {
+            mSm.unregisterListener(mProxListener);
+            mProxRegistered = false;
+            mProximityNear = false;
+        }
+
         if (!needPosture) {
-            stopAllPostureSensors();
+            stopMotionPostureSensorsOnly();
             return;
         }
 
-        if (mProxSensor != null && !mProxRegistered) {
-            mProxRegistered = mSm.registerListener(mProxListener, mProxSensor, SensorManager.SENSOR_DELAY_NORMAL, mH);
-        }
         if (mTiltSensor != null && !mTiltRegistered) {
             mTiltRegistered = mSm.registerListener(mTiltListener, mTiltSensor, SensorManager.SENSOR_DELAY_NORMAL, mH);
         }
@@ -1775,12 +1953,8 @@ public class AodController {
         }
     }
 
-    private void stopAllPostureSensors() {
+    private void stopMotionPostureSensorsOnly() {
         if (mSm == null) return;
-        if (mProxRegistered) {
-            mSm.unregisterListener(mProxListener);
-            mProxRegistered = false;
-        }
         if (mTiltRegistered) {
             mSm.unregisterListener(mTiltListener);
             mTiltRegistered = false;
@@ -1795,6 +1969,356 @@ public class AodController {
         }
         releaseFaceDownWakeLock();
     }
+
+    private void stopAllPostureSensors() {
+        if (mSm == null) return;
+        if (mProxRegistered) {
+            mSm.unregisterListener(mProxListener);
+            mProxRegistered = false;
+            mProximityNear = false;
+        }
+        stopMotionPostureSensorsOnly();
+    }
+
+    // ---- Ambient Light Auto-Brightness (Bounded WakeLock for Debounce/Ramp Only) ----
+
+    private void acquireAutoLightWakeLock(long timeoutMs) {
+        if (mPm == null) return;
+        try {
+            if (mAutoLightWakeLock == null) {
+                mAutoLightWakeLock = mPm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, TAG + ":AutoLight");
+                mAutoLightWakeLock.setReferenceCounted(false);
+            }
+            mAutoLightWakeLock.acquire(Math.max(400L, Math.min(timeoutMs, LIGHT_WAKELOCK_MAX_MS)));
+        } catch (Throwable ignored) {
+        }
+    }
+
+    private void releaseAutoLightWakeLock() {
+        try {
+            if (mAutoLightWakeLock != null && mAutoLightWakeLock.isHeld()) {
+                mAutoLightWakeLock.release();
+            }
+        } catch (Throwable ignored) {
+        }
+    }
+
+    private boolean isLightBlockedByProximity(float cleanLux) {
+        if (!mProximityNear || !mHasAppliedLight) {
+            return false;
+        }
+        return !(cleanLux >= 50f && cleanLux > mAppliedLightLux * 1.35f);
+    }
+
+    private void updateLightSensor() {
+        if (Looper.myLooper() != Looper.getMainLooper()) {
+            mH.post(this::updateLightSensor);
+            return;
+        }
+        if (mCtx == null || mSm == null) return;
+        probeSensorsOnce();
+
+        boolean need = cfgEnabled && cfgAutoBright && isWallpaperAodVisible();
+        if (!need) {
+            if (mLightRegistered) {
+                try {
+                    mSm.unregisterListener(mLightListener);
+                } catch (Throwable ignored) {
+                }
+                mLightRegistered = false;
+            }
+            mPendingLuxActive = false;
+            mForceImmediateAnimatedLight = false;
+            mH.removeCallbacks(mLightDebounceRun);
+            cancelAutoBrightAnim();
+            releaseAutoLightWakeLock();
+            if (!mAod || !cfgAutoBright || mFaceDownPaused || mNightActive || mAodTimedOut) {
+                mHasAppliedLight = false;
+                mAppliedLightLux = -1f;
+                mAppliedLightNorm = -1f;
+                mAutoBrightTargetInt = -1;
+                mAutoBrightTargetFloat = -1f;
+                mCurrentAnimHwFloat = -1f;
+                mCurrentIdealMask = -1f;
+                mCurrentAutoMask = -1f;
+            }
+            return;
+        }
+
+        if (mLightSensor != null && !mLightRegistered) {
+            mHasAppliedLight = false;
+            mForceImmediateAnimatedLight = false;
+            mPendingLuxActive = false;
+            mH.removeCallbacks(mLightDebounceRun);
+            mLastLightEventTs = SystemClock.elapsedRealtime();
+            try {
+                mLightRegistered = mSm.registerListener(
+                        mLightListener, mLightSensor, SensorManager.SENSOR_DELAY_NORMAL, mH);
+            } catch (Throwable t) {
+                mLightRegistered = false;
+                log("register light err: " + t);
+            }
+        }
+    }
+
+    private void onLightSensorChanged(float lux) {
+        if (Float.isNaN(lux) || Float.isInfinite(lux)) return;
+        float cleanLux = Math.max(0f, lux);
+        long now = SystemClock.elapsedRealtime();
+        mRawLightLux = cleanLux;
+        mLastLightEventTs = now;
+
+        if (!cfgEnabled || !cfgAutoBright || !isWallpaperAodVisible()) return;
+        if (isLightBlockedByProximity(cleanLux)) {
+            return;
+        }
+
+        if (!mHasAppliedLight) {
+            mPendingLuxActive = false;
+            mForceImmediateAnimatedLight = false;
+            mH.removeCallbacks(mLightDebounceRun);
+            commitAutoBrightness(cleanLux, false);
+            return;
+        }
+
+        if (mForceImmediateAnimatedLight) {
+            mForceImmediateAnimatedLight = false;
+            mPendingLuxActive = false;
+            mH.removeCallbacks(mLightDebounceRun);
+            commitAutoBrightness(cleanLux, true);
+            return;
+        }
+
+        float newNorm = AmbientLightCurve.luxToNorm(cleanLux);
+        float diff = newNorm - mAppliedLightNorm;
+        if (Math.abs(diff) < LIGHT_DEADBAND_NORM) {
+            mPendingLuxActive = false;
+            mH.removeCallbacks(mLightDebounceRun);
+            if (mAutoBrightAnim == null) {
+                releaseAutoLightWakeLock();
+            }
+            return;
+        }
+
+        int dir = diff > 0f ? 1 : -1;
+        long delay = (dir > 0) ? LIGHT_DEBOUNCE_BRIGHTEN_MS : LIGHT_DEBOUNCE_DARKEN_MS;
+        if (!mPendingLuxActive || mPendingLuxDir != dir) {
+            mPendingLuxActive = true;
+            mPendingLuxDir = dir;
+            mPendingLux = cleanLux;
+            mPendingLuxDueTs = now + delay;
+            acquireAutoLightWakeLock(delay + 400L);
+            mH.removeCallbacks(mLightDebounceRun);
+            mH.postDelayed(mLightDebounceRun, delay);
+        } else {
+            mPendingLux = cleanLux;
+            if (now >= mPendingLuxDueTs) {
+                mPendingLuxActive = false;
+                mH.removeCallbacks(mLightDebounceRun);
+                commitAutoBrightness(mPendingLux, true);
+            } else if (mAutoLightWakeLock == null || !mAutoLightWakeLock.isHeld()) {
+                acquireAutoLightWakeLock((mPendingLuxDueTs - now) + 400L);
+            }
+        }
+    }
+
+    private final Runnable mLightDebounceRun = new Runnable() {
+        @Override
+        public void run() {
+            if (!mPendingLuxActive) return;
+            mPendingLuxActive = false;
+            if (!isWallpaperAodVisible() || !cfgAutoBright || isLightBlockedByProximity(mPendingLux)) {
+                if (mAutoBrightAnim == null) {
+                    releaseAutoLightWakeLock();
+                }
+                return;
+            }
+            commitAutoBrightness(mPendingLux, true);
+        }
+    };
+
+    private void onLightTickCheck() {
+        if (!isWallpaperAodVisible() || !cfgAutoBright) return;
+        long now = SystemClock.elapsedRealtime();
+        if (mPendingLuxActive && now >= mPendingLuxDueTs) {
+            mPendingLuxActive = false;
+            mH.removeCallbacks(mLightDebounceRun);
+            if (!isLightBlockedByProximity(mPendingLux)) {
+                commitAutoBrightness(mPendingLux, true);
+            } else if (mAutoBrightAnim == null) {
+                releaseAutoLightWakeLock();
+            }
+            return;
+        }
+        if (mProximityNear) return;
+        if (mLightRegistered && mLightSensor != null && !mLightSensor.isWakeUpSensor()
+                && (now - mLastLightEventTs >= LIGHT_STALE_REREGISTER_MS)) {
+            try {
+                mSm.unregisterListener(mLightListener);
+                mLightRegistered = mSm.registerListener(
+                        mLightListener, mLightSensor, SensorManager.SENSOR_DELAY_NORMAL, mH);
+            } catch (Throwable t) {
+                mLightRegistered = false;
+                log("light refresh err: " + t);
+            }
+        }
+    }
+
+    private void onLightUncovered() {
+        if (!isWallpaperAodVisible() || !cfgAutoBright || mProximityNear) return;
+        mPendingLuxActive = false;
+        mH.removeCallbacks(mLightDebounceRun);
+        mForceImmediateAnimatedLight = true;
+        acquireAutoLightWakeLock(800L);
+        if (mSm != null && mLightSensor != null) {
+            try {
+                if (mLightRegistered) {
+                    mSm.unregisterListener(mLightListener);
+                    mLightRegistered = false;
+                }
+                mLightRegistered = mSm.registerListener(
+                        mLightListener, mLightSensor, SensorManager.SENSOR_DELAY_NORMAL, mH);
+            } catch (Throwable t) {
+                log("light uncover err: " + t);
+            }
+        }
+    }
+
+    private void commitAutoBrightness(float lux, boolean animate) {
+        if (!isWallpaperAodVisible() || !cfgAutoBright) return;
+        float cleanLux = Math.max(0f, lux);
+        float prevNorm = (mAppliedLightNorm >= 0f) ? mAppliedLightNorm : AmbientLightCurve.luxToNorm(cleanLux);
+        float newNorm = AmbientLightCurve.luxToNorm(cleanLux);
+
+        mHasAppliedLight = true;
+        mAppliedLightLux = cleanLux;
+        mAppliedLightNorm = newNorm;
+
+        int targetPct = AmbientLightCurve.computeBrightnessPct(cleanLux, cfgAutoBrightMin, cfgAutoBrightMax);
+        final int targetInt = AmbientLightCurve.pctToDozeInt(targetPct);
+        mAutoBrightTargetFloat = AmbientLightCurve.pctToDozeFloat(targetPct);
+        mAutoBrightTargetInt = targetInt;
+
+        final float targetMask = AmbientLightCurve.computeDynamicMask(cleanLux, cfgMask);
+        final float startMask = (mCurrentIdealMask >= 0f) ? mCurrentIdealMask
+                : ((mCurrentAutoMask >= 0f) ? mCurrentAutoMask : cfgMask);
+        final float startHwFloat = (mCurrentAnimHwFloat >= 1f) ? mCurrentAnimHwFloat
+                : ((mLastAppliedBrightnessInt > 0) ? (float) mLastAppliedBrightnessInt : (float) targetInt);
+
+        cancelAutoBrightAnim();
+
+        if (!animate || (Math.abs(targetMask - startMask) < 0.008f && Math.abs(targetInt - startHwFloat) < 0.75f)) {
+            log("autoBright: lux=" + AmbientLightCurve.formatLux(cleanLux)
+                    + " (" + AmbientLightCurve.describeLightLevel(cleanLux) + ")"
+                    + " pct=" + targetPct + "% hw=" + targetInt + "/255"
+                    + " mask=" + String.format(Locale.US, "%.2f", targetMask)
+                    + " anim=false");
+            mCurrentIdealMask = targetMask;
+            mCurrentAutoMask = targetMask;
+            mCurrentAnimHwFloat = targetInt;
+            if (mView != null) {
+                mView.setMaskAlpha(targetMask);
+            }
+            pushDozeBrightnessInt(targetInt);
+            if (!mPendingLuxActive) {
+                releaseAutoLightWakeLock();
+            }
+            return;
+        }
+
+        final int durationMs = AmbientLightCurve.computeTransitionDurationMs(
+                prevNorm, newNorm, targetInt >= startHwFloat);
+        log("autoBright: lux=" + AmbientLightCurve.formatLux(cleanLux)
+                + " (" + AmbientLightCurve.describeLightLevel(cleanLux) + ")"
+                + " pct=" + targetPct + "% hw=" + Math.round(startHwFloat) + "->" + targetInt + "/255"
+                + " mask=" + String.format(Locale.US, "%.2f->%.2f", startMask, targetMask)
+                + " dur=" + durationMs + "ms");
+
+        acquireAutoLightWakeLock(durationMs + 350L);
+        final int[] stats = new int[2];
+        final long startWallMs = SystemClock.elapsedRealtime();
+
+        ValueAnimator anim = ValueAnimator.ofFloat(0f, 1f);
+        anim.setDuration(durationMs);
+        anim.setInterpolator(new PathInterpolator(0.25f, 0.1f, 0.25f, 1.0f));
+        anim.addUpdateListener(a -> {
+            if (!isWallpaperAodVisible() || !cfgAutoBright) {
+                a.cancel();
+                return;
+            }
+            float f = (Float) a.getAnimatedValue();
+            float idealHw = AmbientLightCurve.lerpLogBrightness(startHwFloat, (float) targetInt, f);
+            int hwInt = clampInt(Math.round(idealHw), 1, 255);
+            float idealMask = startMask + (targetMask - startMask) * f;
+            float compMask = AmbientLightCurve.compensateMaskForHwStep(idealMask, idealHw, hwInt);
+
+            mCurrentAnimHwFloat = idealHw;
+            mCurrentIdealMask = idealMask;
+            mCurrentAutoMask = compMask;
+
+            if (mView != null) {
+                mView.setMaskAlpha(compMask);
+            }
+            if (hwInt != mLastAppliedBrightnessInt) {
+                pushDozeBrightnessInt(hwInt);
+                stats[1]++;
+            }
+            stats[0]++;
+        });
+        anim.addListener(new AnimatorListenerAdapter() {
+            private boolean cancelled = false;
+
+            @Override
+            public void onAnimationCancel(Animator animation) {
+                cancelled = true;
+            }
+
+            @Override
+            public void onAnimationEnd(Animator animation) {
+                if (mAutoBrightAnim == animation) mAutoBrightAnim = null;
+                if (!cancelled && isWallpaperAodVisible() && cfgAutoBright) {
+                    mCurrentAnimHwFloat = targetInt;
+                    mCurrentIdealMask = targetMask;
+                    mCurrentAutoMask = targetMask;
+                    if (mView != null) {
+                        mView.setMaskAlpha(targetMask);
+                    }
+                    if (mLastAppliedBrightnessInt != targetInt) {
+                        pushDozeBrightnessInt(targetInt);
+                        stats[1]++;
+                    }
+                    log("autoBright anim done: frames=" + stats[0]
+                            + " steps=" + stats[1]
+                            + " elapsed=" + (SystemClock.elapsedRealtime() - startWallMs) + "ms"
+                            + " dur=" + durationMs + "ms");
+                }
+                if (mAutoBrightAnim == null && !mPendingLuxActive) {
+                    releaseAutoLightWakeLock();
+                }
+            }
+        });
+        mAutoBrightAnim = anim;
+        anim.start();
+    }
+
+    private void cancelAutoBrightAnim() {
+        if (mAutoBrightAnim != null) {
+            mAutoBrightAnim.cancel();
+            mAutoBrightAnim = null;
+        }
+    }
+
+    private final SensorEventListener mLightListener = new SensorEventListener() {
+        @Override
+        public void onSensorChanged(SensorEvent event) {
+            if (event == null || event.values == null || event.values.length == 0) return;
+            onLightSensorChanged(event.values[0]);
+        }
+
+        @Override
+        public void onAccuracyChanged(Sensor sensor, int accuracy) {
+        }
+    };
 
     private void armPickupTriggerIfNeeded() {
         if (mSm == null || mPickupSensor == null || mPickupTriggerRegistered) return;
@@ -1872,8 +2396,13 @@ public class AodController {
             if (near != prev) {
                 if (near && cfgFlipOff && !mFaceDownPaused) {
                     startAccelBurst(3000L, true);
-                } else if (!near && mFaceDownPaused) {
-                    startAccelBurst(2500L, true);
+                } else if (!near) {
+                    if (mFaceDownPaused) {
+                        startAccelBurst(2500L, true);
+                    }
+                    if (isWallpaperAodVisible() && cfgAutoBright) {
+                        onLightUncovered();
+                    }
                 }
             }
         }
@@ -2009,6 +2538,7 @@ public class AodController {
         mFaceDownSince = SystemClock.elapsedRealtime();
         mFaceUpSince = 0L;
         log("enterFaceDownAodOff (keep system clock untouched!)");
+        updateLightSensor();
         animateTo(0f, Math.min(cfgAnimOut, 200));
         stopTick();
         mH.post(this::requestAodPaused);

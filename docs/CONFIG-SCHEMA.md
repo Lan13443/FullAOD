@@ -5,7 +5,7 @@ SystemUI 内的 `AodController.refreshConfig()` 每 **3 秒**读一次，解析�
 
 ⚠️ 这是**前后端唯一契约**：字段名、类型、单位变更都会让后端静默回落默认值（表现为"改了没反应"）。
 
-## 1. 字段表（共 19 个，缺一不可）
+## 1. 字段表（共 22 个，缺一不可）
 
 | JSON 字段 | 类型 | 取值 | 默认 | 含义 / 备注 |
 |---|---|---|---|---|
@@ -28,6 +28,9 @@ SystemUI 内的 `AodController.refreshConfig()` 每 **3 秒**读一次，解析�
 | `nightSmart` | bool | true/false | `false` | 智能模式：夜间退化不按 `nightEnd` 结束，而是"次日 05:00 之后第一次亮屏并解锁"时结束。**设备线上值为 true** |
 | `flipOff` | bool | true/false | `true` | 反扣熄屏：手机屏幕朝下水平放置时自动关闭所有 AOD（含时钟与全屏壁纸），翻转朝上时自动恢复显示 |
 | `liftWake` | bool | true/false | `true` | 拿起自动亮屏：熄屏或 AOD 状态下通过姿态传感器识别拿起并抬起手机动作，自动唤醒并点亮锁屏 |
+| `autoBright` | bool | true/false | `true` | 环境光自动亮度：开启后按光线传感器（`TYPE_LIGHT`）动态映射硬件 Doze 亮度并联动壁纸遮罩；仅全屏壁纸 AOD 期间生效，置灰手动 `bright` |
+| `autoBrightMin` | int | 1 – 50 | `4` | 自动亮度最低硬件下限（百分比 `1%–50%`，对应约 `3–128 / 255`） |
+| `autoBrightMax` | int | 20 – 100 | `75` | 自动亮度最高硬件上限（百分比 `20%–100%`，自动保证不低于 `autoBrightMin`） |
 
 ## 2. 单位换算（前端最容易出错的地方）
 
@@ -40,14 +43,15 @@ Prefs 里存的是**整数**，JSON 里存**小数**，比例是 100：
 | `scale` | 103 | `scale` | 1.03 |
 | `shadeMask` | 80 | `shadeMask` | 0.8 |
 
-其余字段（`nightStart` / `animIn` / `aodTimeoutMin` 等）整数直接写入，不做换算。
+其余字段（`nightStart` / `animIn` / `aodTimeoutMin` / `autoBrightMin` / `autoBrightMax` 等）整数直接写入，不做换算。
 
 ## 3. 一份真实可用的线上配置
 
 ```
 {"enabled":true,"mask":0.65,"bright":2,"shift":true,"night":true,"nightStart":23,"nightEnd":7,
  "animIn":550,"animOut":350,"scale":1.03,"shade":false,"shadeMask":0.8,
- "aodTimeoutOn":false,"aodTimeoutMin":30,"aodTimeoutMode":0,"nightMode":1,"nightSmart":true}
+ "aodTimeoutOn":false,"aodTimeoutMin":30,"aodTimeoutMode":0,"nightMode":1,"nightSmart":true,
+ "flipOff":true,"liftWake":true,"autoBright":true,"autoBrightMin":4,"autoBrightMax":75}
 ```
 
 命令行复核方式：

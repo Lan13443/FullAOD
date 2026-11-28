@@ -26,6 +26,9 @@ public final class Prefs {
     public static final String K_NIGHT_SMART = "nightSmart";
     public static final String K_FLIP_OFF = "flipOff";
     public static final String K_LIFT_WAKE = "liftWake";
+    public static final String K_AUTO_BRIGHT = "autoBright";
+    public static final String K_AUTO_BRIGHT_MIN = "autoBrightMin";
+    public static final String K_AUTO_BRIGHT_MAX = "autoBrightMax";
 
     public static final boolean D_ENABLED = true;
     public static final int D_MASK = 65;
@@ -46,6 +49,9 @@ public final class Prefs {
     public static final boolean D_NIGHT_SMART = false;
     public static final boolean D_FLIP_OFF = true;
     public static final boolean D_LIFT_WAKE = true;
+    public static final boolean D_AUTO_BRIGHT = true;
+    public static final int D_AUTO_BRIGHT_MIN = 4;
+    public static final int D_AUTO_BRIGHT_MAX = 75;
 
     private Prefs() {
     }
@@ -75,6 +81,9 @@ public final class Prefs {
                 .putBoolean(K_NIGHT_SMART, D_NIGHT_SMART)
                 .putBoolean(K_FLIP_OFF, D_FLIP_OFF)
                 .putBoolean(K_LIFT_WAKE, D_LIFT_WAKE)
+                .putBoolean(K_AUTO_BRIGHT, D_AUTO_BRIGHT)
+                .putInt(K_AUTO_BRIGHT_MIN, D_AUTO_BRIGHT_MIN)
+                .putInt(K_AUTO_BRIGHT_MAX, D_AUTO_BRIGHT_MAX)
                 .apply();
     }
 }

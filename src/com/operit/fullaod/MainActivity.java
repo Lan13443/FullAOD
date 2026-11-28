@@ -26,8 +26,13 @@ import android.graphics.drawable.BitmapDrawable;
 import android.graphics.drawable.Drawable;
 import android.graphics.drawable.GradientDrawable;
 import android.graphics.drawable.Icon;
+import android.hardware.Sensor;
+import android.hardware.SensorEvent;
+import android.hardware.SensorEventListener;
+import android.hardware.SensorManager;
 import android.os.Build;
 import android.os.Bundle;
+import android.os.SystemClock;
 import android.provider.Settings;
 import android.util.Log;
 import android.util.TypedValue;
@@ -120,6 +125,17 @@ public class MainActivity extends Activity {
     private boolean mGestureLockedVertical = false;
     private int mTouchSlop;
 
+    // Live Ambient Light Sensor Preview (only active on SUBPAGE_DISPLAY)
+    private SensorManager mUiSensorManager;
+    private Sensor mUiLightSensor;
+    private boolean mUiLightRegistered = false;
+    private float mUiLastLux = -1f;
+    private long mLastUiLuxUpdateTs = 0L;
+    private WallpaperAodView mPreviewAodView;
+    private TextView mPreviewLuxPillTv;
+    private ValueAnimator mPreviewMaskAnim;
+    private float mPreviewCurrentMask = 0.65f;
+
     @Override
     protected void onCreate(Bundle b) {
         super.onCreate(b);
@@ -150,6 +166,22 @@ public class MainActivity extends Activity {
     protected void onResume() {
         super.onResume();
         refreshDynamicSummaries();
+        if (mCurrentSubPage == SUBPAGE_DISPLAY) {
+            startPreviewLightSensor();
+            updateDisplayPreview(false);
+        }
+    }
+
+    @Override
+    protected void onPause() {
+        super.onPause();
+        stopPreviewLightSensor();
+    }
+
+    @Override
+    protected void onDestroy() {
+        stopPreviewLightSensor();
+        super.onDestroy();
     }
 
     @Override
@@ -159,8 +191,8 @@ public class MainActivity extends Activity {
     }
 
     /**
-     * 修复首启不同步缺陷（详见 docs/UI-STRUCTURE.md 第 4 节）：
-     * 若本地 SharedPreferences 尚未初始化，先从 Settings.Secure "fullaod_cfg" 导入当前线上 17 个字段。
+     * 修复首启不同步缺陷（详见 docs/UI-STRUCTURE.md 第 3 节）：
+     * 若本地 SharedPreferences 尚未初始化，先从 Settings.Secure "fullaod_cfg" 导入当前线上 22 个字段。
      */
     private void importFromSecureSettingsIfFirstRun() {
         if (!mSp.contains(Prefs.K_ENABLED) || mSp.getAll().isEmpty()) {
@@ -201,6 +233,9 @@ public class MainActivity extends Activity {
         int timeoutMin = clampRange(o.optInt("aodTimeoutMin", Prefs.D_TIMEOUT_MIN), 5, 180);
         int timeoutMode = clampRange(o.optInt("aodTimeoutMode", Prefs.D_TIMEOUT_MODE), 0, 1);
         int nightMode = clampRange(o.optInt("nightMode", Prefs.D_NIGHT_MODE), 0, 1);
+        int autoMin = clampRange(o.optInt("autoBrightMin", Prefs.D_AUTO_BRIGHT_MIN), 1, 50);
+        int autoMax = clampRange(o.optInt("autoBrightMax", Prefs.D_AUTO_BRIGHT_MAX), 20, 100);
+        if (autoMax < autoMin) autoMax = autoMin;
 
         mSp.edit()
                 .putBoolean(Prefs.K_ENABLED, o.optBoolean("enabled", Prefs.D_ENABLED))
@@ -222,6 +257,9 @@ public class MainActivity extends Activity {
                 .putBoolean(Prefs.K_NIGHT_SMART, o.optBoolean("nightSmart", Prefs.D_NIGHT_SMART))
                 .putBoolean(Prefs.K_FLIP_OFF, o.optBoolean("flipOff", Prefs.D_FLIP_OFF))
                 .putBoolean(Prefs.K_LIFT_WAKE, o.optBoolean("liftWake", Prefs.D_LIFT_WAKE))
+                .putBoolean(Prefs.K_AUTO_BRIGHT, o.optBoolean("autoBright", Prefs.D_AUTO_BRIGHT))
+                .putInt(Prefs.K_AUTO_BRIGHT_MIN, autoMin)
+                .putInt(Prefs.K_AUTO_BRIGHT_MAX, autoMax)
                 .apply();
     }
 
@@ -255,6 +293,9 @@ public class MainActivity extends Activity {
     }
 
     public void rebuildThemeInPlace() {
+        stopPreviewLightSensor();
+        mPreviewAodView = null;
+        mPreviewLuxPillTv = null;
         int homeScrollY = mHomeScroll != null ? mHomeScroll.getScrollY() : 0;
         int settingsScrollY = mSettingsScroll != null ? mSettingsScroll.getScrollY() : 0;
         final int subScrollY = mSubPageScroll != null ? mSubPageScroll.getScrollY() : 0;
@@ -777,7 +818,7 @@ public class MainActivity extends Activity {
 
         addNavRow(dataCard,
                 "导出设置",
-                "将当前 17 项 AOD 参数导出为 JSON 并复制到剪贴板",
+                "将当前 22 项 AOD 参数导出为 JSON 并复制到剪贴板",
                 new View.OnClickListener() {
                     @Override
                     public void onClick(View v) {
@@ -823,6 +864,9 @@ public class MainActivity extends Activity {
     // Secondary Detail Pages (二级菜单 + 图4/图5 主题设置页)
     // =========================================================================
     private void openSubPage(int subPageId, boolean animate) {
+        stopPreviewLightSensor();
+        mPreviewAodView = null;
+        mPreviewLuxPillTv = null;
         mCurrentSubPage = subPageId;
         mSubPageOverlay.removeAllViews();
 
@@ -902,9 +946,12 @@ public class MainActivity extends Activity {
 
     private void closeSubPage(boolean animate) {
         if (mCurrentSubPage == SUBPAGE_NONE) return;
+        stopPreviewLightSensor();
         refreshDynamicSummaries();
         if (!animate) {
             mCurrentSubPage = SUBPAGE_NONE;
+            mPreviewAodView = null;
+            mPreviewLuxPillTv = null;
             mSubPageOverlay.setVisibility(View.GONE);
             mSubPageOverlay.removeAllViews();
             mSubPageScroll = null;
@@ -939,6 +986,8 @@ public class MainActivity extends Activity {
                     public void onAnimationEnd(Animator animation) {
                         mSubPageOverlay.animate().setListener(null);
                         mCurrentSubPage = SUBPAGE_NONE;
+                        mPreviewAodView = null;
+                        mPreviewLuxPillTv = null;
                         mSubPageOverlay.setVisibility(View.GONE);
                         mSubPageOverlay.removeAllViews();
                         mSubPageScroll = null;
@@ -970,12 +1019,12 @@ public class MainActivity extends Activity {
     }
 
     // -------------------------------------------------------------------------
-    // SubPage 1: 壁纸显示与亮度 (Live WallpaperAodView Preview + Mask/Bright/Scale)
+    // SubPage 1: 壁纸显示与亮度 (Live WallpaperAodView + Ambient Light Preview)
     // -------------------------------------------------------------------------
     private void populateDisplaySubPage(LinearLayout root) {
-        root.addView(buildSectionHeader("实时壁纸暗化预览"));
+        root.addView(buildSectionHeader("实时壁纸与环境光预览"));
 
-        // Live WallpaperAodView Preview Card (docs/UI-STRUCTURE.md Section 5)
+        // Live WallpaperAodView Preview Card (docs/UI-STRUCTURE.md)
         LinearLayout previewCard = createRoundedCard();
         previewCard.setPadding(dp(14), dp(14), dp(14), dp(14));
 
@@ -987,17 +1036,18 @@ public class MainActivity extends Activity {
         previewBox.setClipToOutline(true);
         previewBox.setOutlineProvider(ViewOutlineProvider.BACKGROUND);
 
-        final WallpaperAodView aodPreview = new WallpaperAodView(this);
-        aodPreview.setBitmap(loadPreviewWallpaperBitmap());
-        int curMask = mSp.getInt(Prefs.K_MASK, Prefs.D_MASK);
-        aodPreview.setMaskAlpha(curMask / 100f);
-        previewBox.addView(aodPreview, new FrameLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT, dp(170)));
+        mPreviewAodView = new WallpaperAodView(this);
+        mPreviewAodView.setBitmap(loadPreviewWallpaperBitmap());
+        mPreviewCurrentMask = mSp.getInt(Prefs.K_MASK, Prefs.D_MASK) / 100f;
+        mPreviewAodView.setMaskAlpha(mPreviewCurrentMask);
+        previewBox.addView(mPreviewAodView, new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, dp(188)));
 
         // Simulated Pixel AOD Clock overlay inside preview
         LinearLayout clockOverlay = new LinearLayout(this);
         clockOverlay.setOrientation(LinearLayout.VERTICAL);
         clockOverlay.setGravity(Gravity.CENTER);
+        clockOverlay.setPadding(0, 0, 0, dp(24));
         TextView clockTv = new TextView(this);
         clockTv.setText("09:41");
         clockTv.setTextColor(0xE6FFFFFF);
@@ -1014,8 +1064,97 @@ public class MainActivity extends Activity {
         previewBox.addView(clockOverlay, new FrameLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
 
+        mPreviewLuxPillTv = new TextView(this);
+        GradientDrawable pillBg = new GradientDrawable();
+        pillBg.setCornerRadius(dp(12));
+        pillBg.setColor(0x99000000);
+        mPreviewLuxPillTv.setBackground(pillBg);
+        mPreviewLuxPillTv.setTextColor(0xF2FFFFFF);
+        mPreviewLuxPillTv.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f);
+        mPreviewLuxPillTv.setPadding(dp(10), dp(4), dp(10), dp(4));
+        FrameLayout.LayoutParams pillLp = new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT,
+                Gravity.BOTTOM | Gravity.CENTER_HORIZONTAL);
+        pillLp.bottomMargin = dp(10);
+        previewBox.addView(mPreviewLuxPillTv, pillLp);
+
         previewCard.addView(previewBox);
         root.addView(previewCard, createCardMarginParams(10));
+
+        // Ambient Light Auto-Brightness Card
+        root.addView(buildSectionHeader("环境光自动亮度"));
+        LinearLayout autoCard = createRoundedCard();
+
+        final List<View> autoDependentViews = new ArrayList<View>();
+        final List<View> manualBrightViews = new ArrayList<View>();
+        boolean autoOn = mSp.getBoolean(Prefs.K_AUTO_BRIGHT, Prefs.D_AUTO_BRIGHT);
+
+        addCustomSwitchRow(autoCard,
+                "环境光自动调节 AOD 亮度",
+                "开启后按环境光自动在最低～最高区间调节硬件亮度，并联动深浅壁纸遮罩（暗光加深、强光减淡），仅全屏壁纸 AOD 期间低功耗采样",
+                autoOn,
+                new ModernSwitchView.OnCheckedChangeListener() {
+                    @Override
+                    public void onCheckedChanged(ModernSwitchView view, boolean isChecked) {
+                        mSp.edit().putBoolean(Prefs.K_AUTO_BRIGHT, isChecked).apply();
+                        pushToSettings();
+                        setDependentViewsEnabled(autoDependentViews, isChecked);
+                        setDependentViewsEnabled(manualBrightViews, !isChecked);
+                        refreshDynamicSummaries();
+                        updateDisplayPreview(true);
+                    }
+                });
+
+        final ModernSliderView[] rangeSliders = new ModernSliderView[2];
+
+        View minBlock = addSliderBlock(autoCard,
+                "最低硬件亮度",
+                "极暗环境（如夜间关灯 0–2 lux）下压低到的硬件 Doze 亮度下限，保持微亮不刺眼",
+                1, 50, Prefs.K_AUTO_BRIGHT_MIN, Prefs.D_AUTO_BRIGHT_MIN, "%",
+                new ModernSliderView.OnValueChangeListener() {
+                    @Override
+                    public void onValueChanged(int value, boolean fromUser) {
+                        if (fromUser && rangeSliders[1] != null && value > rangeSliders[1].getValue()) {
+                            rangeSliders[1].setValue(value, true);
+                            mSp.edit().putInt(Prefs.K_AUTO_BRIGHT_MAX, value).apply();
+                            pushToSettings();
+                            refreshDynamicSummaries();
+                        }
+                        if (fromUser) {
+                            updateDisplayPreview(false);
+                        }
+                    }
+                });
+        if (minBlock.getTag() instanceof ModernSliderView) {
+            rangeSliders[0] = (ModernSliderView) minBlock.getTag();
+        }
+        autoDependentViews.add(minBlock);
+
+        View maxBlock = addSliderBlock(autoCard,
+                "最高硬件亮度",
+                "户外强光环境下自动提升到的硬件 Doze 亮度上限，确保大太阳下壁纸与时钟清晰可读",
+                20, 100, Prefs.K_AUTO_BRIGHT_MAX, Prefs.D_AUTO_BRIGHT_MAX, "%",
+                new ModernSliderView.OnValueChangeListener() {
+                    @Override
+                    public void onValueChanged(int value, boolean fromUser) {
+                        if (fromUser && rangeSliders[0] != null && value < rangeSliders[0].getValue()) {
+                            rangeSliders[0].setValue(value, true);
+                            mSp.edit().putInt(Prefs.K_AUTO_BRIGHT_MIN, value).apply();
+                            pushToSettings();
+                            refreshDynamicSummaries();
+                        }
+                        if (fromUser) {
+                            updateDisplayPreview(false);
+                        }
+                    }
+                });
+        if (maxBlock.getTag() instanceof ModernSliderView) {
+            rangeSliders[1] = (ModernSliderView) maxBlock.getTag();
+        }
+        autoDependentViews.add(maxBlock);
+
+        setDependentViewsEnabled(autoDependentViews, autoOn);
+        root.addView(autoCard, createCardMarginParams(10));
 
         // Sliders Card
         root.addView(buildSectionHeader("视觉参数调节"));
@@ -1023,19 +1162,23 @@ public class MainActivity extends Activity {
 
         addSliderBlock(paramCard,
                 "壁纸暗化程度",
-                "叠加在熄屏壁纸上的暗化遮罩浓度（0%–95%）。数值越高背景越深邃省电，推荐 60%–75%。",
+                "壁纸暗化遮罩浓度（0%–95%）。开启自动亮度时作为室内基准，暗光自动加深、强光自动减淡，推荐 60%–75%。",
                 0, 95, Prefs.K_MASK, Prefs.D_MASK, "%",
                 new ModernSliderView.OnValueChangeListener() {
                     @Override
                     public void onValueChanged(int value, boolean fromUser) {
-                        aodPreview.setMaskAlpha(value / 100f);
+                        if (fromUser) {
+                            updateDisplayPreview(false);
+                        }
                     }
                 });
 
-        addSliderBlock(paramCard,
-                "AOD 亮度倍数",
-                "在原生 Doze 屏幕亮度基础上的增益比例（100%–300%）。默认 200% (2.0×) 可显著改善暗光壁纸通透感。",
+        View brightBlock = addSliderBlock(paramCard,
+                "AOD 亮度倍数（手动模式）",
+                "关闭自动亮度时生效：在原生 Doze 屏幕亮度基础上增益（100%–300%）。开启自动亮度时此项自动禁用。",
                 100, 300, Prefs.K_BRIGHT, Prefs.D_BRIGHT, "%", null);
+        manualBrightViews.add(brightBlock);
+        setDependentViewsEnabled(manualBrightViews, !autoOn);
 
         addSliderBlock(paramCard,
                 "放大倍率",
@@ -1043,6 +1186,124 @@ public class MainActivity extends Activity {
                 100, 110, Prefs.K_SCALE, Prefs.D_SCALE, "%", null);
 
         root.addView(paramCard, createCardMarginParams(14));
+
+        startPreviewLightSensor();
+        updateDisplayPreview(false);
+    }
+
+    private final SensorEventListener mUiLightListener = new SensorEventListener() {
+        @Override
+        public void onSensorChanged(SensorEvent event) {
+            if (event == null || event.values == null || event.values.length == 0) return;
+            if (mCurrentSubPage != SUBPAGE_DISPLAY) return;
+            float raw = event.values[0];
+            if (Float.isNaN(raw) || Float.isInfinite(raw)) return;
+            float lux = Math.max(0f, raw);
+            long now = SystemClock.elapsedRealtime();
+            float prevNorm = (mUiLastLux >= 0f) ? AmbientLightCurve.luxToNorm(mUiLastLux) : -1f;
+            float nextNorm = AmbientLightCurve.luxToNorm(lux);
+            if (mUiLastLux >= 0f && (now - mLastUiLuxUpdateTs) < 120L && Math.abs(nextNorm - prevNorm) < 0.03f) {
+                return;
+            }
+            mUiLastLux = lux;
+            mLastUiLuxUpdateTs = now;
+            updateDisplayPreview(true);
+        }
+
+        @Override
+        public void onAccuracyChanged(Sensor sensor, int accuracy) {
+        }
+    };
+
+    private void startPreviewLightSensor() {
+        try {
+            if (mUiSensorManager == null) {
+                mUiSensorManager = (SensorManager) getSystemService(Context.SENSOR_SERVICE);
+            }
+            if (mUiLightSensor == null && mUiSensorManager != null) {
+                mUiLightSensor = mUiSensorManager.getDefaultSensor(Sensor.TYPE_LIGHT);
+            }
+            if (mUiSensorManager != null && mUiLightSensor != null && !mUiLightRegistered) {
+                mUiLightRegistered = mUiSensorManager.registerListener(
+                        mUiLightListener, mUiLightSensor, SensorManager.SENSOR_DELAY_UI);
+            }
+        } catch (Throwable ignored) {
+        }
+    }
+
+    private void stopPreviewLightSensor() {
+        if (mPreviewMaskAnim != null) {
+            mPreviewMaskAnim.cancel();
+            mPreviewMaskAnim = null;
+        }
+        if (mUiLightRegistered && mUiSensorManager != null) {
+            try {
+                mUiSensorManager.unregisterListener(mUiLightListener);
+            } catch (Throwable ignored) {
+            }
+            mUiLightRegistered = false;
+        }
+    }
+
+    private void updateDisplayPreview(boolean animate) {
+        if (mPreviewAodView == null) return;
+        boolean autoOn = mSp.getBoolean(Prefs.K_AUTO_BRIGHT, Prefs.D_AUTO_BRIGHT);
+        int baseMaskPct = mSp.getInt(Prefs.K_MASK, Prefs.D_MASK);
+        int brightPct = mSp.getInt(Prefs.K_BRIGHT, Prefs.D_BRIGHT);
+        int minPct = mSp.getInt(Prefs.K_AUTO_BRIGHT_MIN, Prefs.D_AUTO_BRIGHT_MIN);
+        int maxPct = Math.max(minPct, mSp.getInt(Prefs.K_AUTO_BRIGHT_MAX, Prefs.D_AUTO_BRIGHT_MAX));
+
+        final float targetMask;
+        String pillText;
+        if (!autoOn) {
+            targetMask = baseMaskPct / 100f;
+            pillText = "手动模式 · 倍数 " + brightPct + "% (" + String.format("%.1f×", brightPct / 100f)
+                    + ") · 固定遮罩 " + baseMaskPct + "%";
+        } else if (mUiLightSensor == null) {
+            targetMask = baseMaskPct / 100f;
+            pillText = "未检测到光线传感器 · 按基准遮罩 " + baseMaskPct + "%";
+        } else if (mUiLastLux < 0f) {
+            targetMask = baseMaskPct / 100f;
+            pillText = "正在读取光线传感器… · 基准遮罩 " + baseMaskPct + "%";
+        } else {
+            int hwPct = AmbientLightCurve.computeBrightnessPct(mUiLastLux, minPct, maxPct);
+            int hwInt = AmbientLightCurve.pctToDozeInt(hwPct);
+            targetMask = AmbientLightCurve.computeDynamicMask(mUiLastLux, baseMaskPct / 100f);
+            pillText = "☀ " + AmbientLightCurve.formatLux(mUiLastLux)
+                    + " (" + AmbientLightCurve.describeLightLevel(mUiLastLux) + ")"
+                    + " → 硬件 " + hwPct + "% (" + hwInt + "/255)"
+                    + " · 遮罩 " + Math.round(targetMask * 100f) + "%";
+        }
+
+        if (mPreviewLuxPillTv != null) {
+            mPreviewLuxPillTv.setText(pillText);
+        }
+
+        if (mPreviewMaskAnim != null) {
+            mPreviewMaskAnim.cancel();
+            mPreviewMaskAnim = null;
+        }
+        if (!animate || Math.abs(targetMask - mPreviewCurrentMask) < 0.008f) {
+            mPreviewCurrentMask = targetMask;
+            mPreviewAodView.setMaskAlpha(targetMask);
+            return;
+        }
+        final float startMask = mPreviewCurrentMask;
+        ValueAnimator anim = ValueAnimator.ofFloat(startMask, targetMask);
+        anim.setDuration(260);
+        anim.setInterpolator(new DecelerateInterpolator());
+        anim.addUpdateListener(new ValueAnimator.AnimatorUpdateListener() {
+            @Override
+            public void onAnimationUpdate(ValueAnimator animation) {
+                float v = (Float) animation.getAnimatedValue();
+                mPreviewCurrentMask = v;
+                if (mPreviewAodView != null) {
+                    mPreviewAodView.setMaskAlpha(v);
+                }
+            }
+        });
+        mPreviewMaskAnim = anim;
+        anim.start();
     }
 
     // -------------------------------------------------------------------------
@@ -1567,6 +1828,9 @@ public class MainActivity extends Activity {
         int shadeMask = mSp.getInt(Prefs.K_SHADE_MASK, Prefs.D_SHADE_MASK);
         boolean flipOff = mSp.getBoolean(Prefs.K_FLIP_OFF, Prefs.D_FLIP_OFF);
         boolean liftWake = mSp.getBoolean(Prefs.K_LIFT_WAKE, Prefs.D_LIFT_WAKE);
+        boolean autoBright = mSp.getBoolean(Prefs.K_AUTO_BRIGHT, Prefs.D_AUTO_BRIGHT);
+        int autoMin = mSp.getInt(Prefs.K_AUTO_BRIGHT_MIN, Prefs.D_AUTO_BRIGHT_MIN);
+        int autoMax = Math.max(autoMin, mSp.getInt(Prefs.K_AUTO_BRIGHT_MAX, Prefs.D_AUTO_BRIGHT_MAX));
 
         if (mHeroCard != null) {
             mHeroCard.setState(mTheme, enabled);
@@ -1574,14 +1838,20 @@ public class MainActivity extends Activity {
         if (mHomeMasterSwitch != null && mHomeMasterSwitch.isChecked() != enabled) {
             mHomeMasterSwitch.setChecked(enabled, false, false);
         }
+        String brightSummary = autoBright
+                ? ("自动亮度 " + autoMin + "%–" + autoMax + "%")
+                : ("亮度 " + bright + "% (" + String.format("%.1f×", bright / 100f) + ")");
         if (mHomeProfileSummaryTv != null) {
-            String summary = "暗化 " + mask + "% · 亮度 " + bright + "% (" + String.format("%.1f×", bright / 100f) + ")"
+            String summary = (autoBright ? "基准暗化 " : "暗化 ") + mask + "% · " + brightSummary
                     + (flipOff ? " · 反扣熄屏" : "")
                     + (liftWake ? " · 抬手亮屏" : "");
             mHomeProfileSummaryTv.setText(summary);
         }
         if (mSubDisplaySummaryTv != null) {
-            mSubDisplaySummaryTv.setText("当前：暗化 " + mask + "% · 亮度 " + bright + "% · 放大 " + scale + "%（点击调节与预览）");
+            mSubDisplaySummaryTv.setText("当前："
+                    + (autoBright ? ("自动亮度 " + autoMin + "%–" + autoMax + "% · 基准暗化 ")
+                    : ("亮度 " + bright + "% · 暗化 "))
+                    + mask + "% · 放大 " + scale + "%（点击调节与预览）");
         }
         if (mSubAnimSummaryTv != null) {
             mSubAnimSummaryTv.setText("当前：熄屏淡入 " + animIn + " ms · 亮屏淡出 " + animOut + " ms");
@@ -1611,7 +1881,7 @@ public class MainActivity extends Activity {
             }
         }
         if (mBottomBar != null) {
-            int activeFeatures = (enabled ? 1 : 0) + (shift ? 1 : 0) + (night ? 1 : 0)
+            int activeFeatures = (enabled ? 1 : 0) + (autoBright ? 1 : 0) + (shift ? 1 : 0) + (night ? 1 : 0)
                     + (timeoutOn ? 1 : 0) + (shade ? 1 : 0)
                     + (flipOff ? 1 : 0) + (liftWake ? 1 : 0);
             mBottomBar.setBadgeInfo(enabled, activeFeatures);
@@ -2161,6 +2431,7 @@ public class MainActivity extends Activity {
             }
         });
         block.addView(slider);
+        block.setTag(slider);
 
         card.addView(block);
         return block;
@@ -2253,6 +2524,9 @@ public class MainActivity extends Activity {
         }
         if (Prefs.K_SCALE.equals(key)) {
             return val + "% (" + String.format("%.2f×", val / 100f) + ")";
+        }
+        if (Prefs.K_AUTO_BRIGHT_MIN.equals(key) || Prefs.K_AUTO_BRIGHT_MAX.equals(key)) {
+            return val + "% (" + AmbientLightCurve.pctToDozeInt(val) + "/255)";
         }
         return val + unit;
     }
@@ -2365,7 +2639,7 @@ public class MainActivity extends Activity {
                     @Override
                     public void onClick(DialogInterface dialog, int which) {
                         pushToSettings();
-                        Toast.makeText(MainActivity.this, "已重新推送 17 项配置到 Settings.Secure", Toast.LENGTH_SHORT).show();
+                        Toast.makeText(MainActivity.this, "已重新推送 22 项配置到 Settings.Secure", Toast.LENGTH_SHORT).show();
                     }
                 })
                 .setNegativeButton("关闭", null)
@@ -2451,7 +2725,7 @@ public class MainActivity extends Activity {
     }
 
     // =========================================================================
-    // Core Backend Contract (STRICT 17-FIELD JSON — DO NOT ALTER KEYS OR TYPES)
+    // Core Backend Contract (22-FIELD JSON — KEEP IN SYNC WITH ConfigProvider)
     // =========================================================================
     private JSONObject buildCurrentConfigJson() {
         JSONObject o = new JSONObject();
@@ -2475,6 +2749,11 @@ public class MainActivity extends Activity {
             o.put("nightSmart", mSp.getBoolean(Prefs.K_NIGHT_SMART, Prefs.D_NIGHT_SMART));
             o.put("flipOff", mSp.getBoolean(Prefs.K_FLIP_OFF, Prefs.D_FLIP_OFF));
             o.put("liftWake", mSp.getBoolean(Prefs.K_LIFT_WAKE, Prefs.D_LIFT_WAKE));
+            o.put("autoBright", mSp.getBoolean(Prefs.K_AUTO_BRIGHT, Prefs.D_AUTO_BRIGHT));
+            int autoMin = clampRange(mSp.getInt(Prefs.K_AUTO_BRIGHT_MIN, Prefs.D_AUTO_BRIGHT_MIN), 1, 50);
+            int autoMax = Math.max(autoMin, clampRange(mSp.getInt(Prefs.K_AUTO_BRIGHT_MAX, Prefs.D_AUTO_BRIGHT_MAX), 20, 100));
+            o.put("autoBrightMin", autoMin);
+            o.put("autoBrightMax", autoMax);
         } catch (Throwable t) {
             Log.w("FullAOD", "buildCurrentConfigJson fail", t);
         }

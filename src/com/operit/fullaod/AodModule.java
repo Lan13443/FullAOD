@@ -187,8 +187,10 @@ public class AodModule implements IXposedHookLoadPackage {
                 };
                 Set<XC_MethodHook.Unhook> h1 = XposedBridge.hookAllMethods(fCls, "setDozeScreenBrightness", intHook);
                 if (h1 != null) forwarderHooks += h1.size();
-                Set<XC_MethodHook.Unhook> h2 = XposedBridge.hookAllMethods(fCls, "dispatchDozeBrightness", intHook);
+                Set<XC_MethodHook.Unhook> h2 = XposedBridge.hookAllMethods(fCls, "setDozeScreenBrightnessFloat", intHook);
                 if (h2 != null) forwarderHooks += h2.size();
+                Set<XC_MethodHook.Unhook> h3 = XposedBridge.hookAllMethods(fCls, "dispatchDozeBrightness", intHook);
+                if (h3 != null) forwarderHooks += h3.size();
             }
         } catch (Throwable t) {
             ctrl.log("hook forwarder brightness err: " + t);

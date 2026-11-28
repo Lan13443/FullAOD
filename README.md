@@ -1,6 +1,6 @@
 # FullAOD —— 类原生 Android 14+ 全屏熄屏显示 LSPosed 模块
 
-> **当前发布版本：`v1.6`**（2026-11-28）｜[下载最新版](https://github.com/Lan13443/FullAOD/releases/latest)
+> **当前发布版本：`v1.7`**（2026-11-29）｜[下载最新版](https://github.com/Lan13443/FullAOD/releases/latest)
 
 > 为类原生 Android 14+（PixelOS / LineageOS / Evolution X / crDroid 等 AOSP 系 ROM）补齐**锁屏全屏壁纸 AOD（Always-On Display）**体验：熄屏显示主屏幕壁纸 + 保留原生 Pixel AOD 时钟 + iOS 式景深缩放过渡动画 + 智能姿态感应。
 
@@ -10,7 +10,8 @@
 
 ### 1. 全屏熄屏渲染与防烧屏
 - **全屏壁纸 + 原生 AOD 时钟**：在 `SystemUI` 的 `NotificationShadeWindowView` 底层注入自绘壁纸层并压制 Scrim 遮罩，保留原生 Pixel 锁屏时钟与通知图标。
-- **壁纸暗化与亮度增益**：支持 `0%–95%` 暗化遮罩调节与 `100%–300% (1.0×–3.0×)` Doze 亮度倍数放大（兼容浮点 `0.0~1.0` 与整数 `1~255` 两种硬件亮度制式）。
+- **壁纸暗化与亮度增益**：支持 `0%–95%` 暗化遮罩调节与 `100%–300% (1.0×–3.0×)` 手动 Doze 亮度倍数放大（兼容浮点 `0.0~1.0` 与整数 `1~255` 两种硬件亮度制式）。
+- **环境光自动调节 AOD 亮度（`autoBright`，默认开启）**：仅在全屏壁纸 AOD 实际可见期间低功耗监听 `TYPE_LIGHT`（优先硬件唤醒光感，静置零唤醒锁）；支持 `180ms` 快速响应提亮与 `1200ms` 变暗防抖、强光穿透距离防误拦、对数感知空间 `1/255` 逐格丝滑缓变 + 壁纸层亚刻度微补偿（`750–1600ms` 自适应可打断动画，内置实时光感状态预览）；降级仅时钟时自动归还原生亮度策略。
 - **iOS 风格景深过渡动效**：自定义熄屏淡入时长（`150–1500 ms`）、亮屏唤醒淡出时长（`100–1000 ms`）以及壁纸微距放大倍率（`100%–110%`）。
 - **OLED 像素位移防烧屏**：每 90 秒在 `±3px` 范围内周期性微移壁纸，避免静态像素老化。
 - **壁纸更换自动同步**：监听系统 `ACTION_WALLPAPER_CHANGED` 广播，更换壁纸后自动重载，无需重启 SystemUI。
@@ -38,9 +39,9 @@
 
 ## 📦 安装与使用
 
-1. 从 [Releases](../../releases) 下载最新 `FullAOD-v1.6.apk`（或使用本地构建产物）并安装到手机。
+1. 从 [Releases](../../releases) 下载最新 `FullAOD-v1.7.apk`（或使用本地构建产物）并安装到手机。
 2. 打开 **LSPosed 管理器** → 启用 **FullAOD** 模块 → 勾选作用域 **`系统界面 (com.android.systemui)`**。
-3. 打开一次 **FullAOD** 应用（自动完成 `WRITE_SECURE_SETTINGS` 权限自愈并同步 19 项配置至 `Settings.Secure`）。
+3. 打开一次 **FullAOD** 应用（自动完成 `WRITE_SECURE_SETTINGS` 权限自愈并同步 22 项配置至 `Settings.Secure`）。
 4. 重启一次 SystemUI（`su -c "killall com.android.systemui"`）或重启手机即可生效；后续调整任何参数均在**下次熄屏时自动生效**，无需再次重启。
 
 ---

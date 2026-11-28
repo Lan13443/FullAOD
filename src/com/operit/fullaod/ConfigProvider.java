@@ -44,6 +44,9 @@ public class ConfigProvider extends ContentProvider {
             o.put("nightSmart", sp.getBoolean(Prefs.K_NIGHT_SMART, Prefs.D_NIGHT_SMART));
             o.put("flipOff", sp.getBoolean(Prefs.K_FLIP_OFF, Prefs.D_FLIP_OFF));
             o.put("liftWake", sp.getBoolean(Prefs.K_LIFT_WAKE, Prefs.D_LIFT_WAKE));
+            o.put("autoBright", sp.getBoolean(Prefs.K_AUTO_BRIGHT, Prefs.D_AUTO_BRIGHT));
+            o.put("autoBrightMin", sp.getInt(Prefs.K_AUTO_BRIGHT_MIN, Prefs.D_AUTO_BRIGHT_MIN));
+            o.put("autoBrightMax", sp.getInt(Prefs.K_AUTO_BRIGHT_MAX, Prefs.D_AUTO_BRIGHT_MAX));
             json = o.toString();
         } catch (Throwable ignored) {
         }
