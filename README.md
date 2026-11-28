@@ -1,6 +1,6 @@
 # FullAOD —— 类原生 Android 14+ 全屏熄屏显示 LSPosed 模块
 
-> **当前发布版本：`v1.5-opt`**（2026-11-25）｜[下载最新版](https://github.com/Lan13443/FullAOD/releases/latest)
+> **当前发布版本：`v1.6`**（2026-11-28）｜[下载最新版](https://github.com/Lan13443/FullAOD/releases/latest)
 
 > 为类原生 Android 14+（PixelOS / LineageOS / Evolution X / crDroid 等 AOSP 系 ROM）补齐**锁屏全屏壁纸 AOD（Always-On Display）**体验：熄屏显示主屏幕壁纸 + 保留原生 Pixel AOD 时钟 + iOS 式景深缩放过渡动画 + 智能姿态感应。
 
@@ -14,6 +14,7 @@
 - **iOS 风格景深过渡动效**：自定义熄屏淡入时长（`150–1500 ms`）、亮屏唤醒淡出时长（`100–1000 ms`）以及壁纸微距放大倍率（`100%–110%`）。
 - **OLED 像素位移防烧屏**：每 90 秒在 `±3px` 范围内周期性微移壁纸，避免静态像素老化。
 - **壁纸更换自动同步**：监听系统 `ACTION_WALLPAPER_CHANGED` 广播，更换壁纸后自动重载，无需重启 SystemUI。
+- **全屏 AOD / 锁屏 / 桌面裁切与缩放对齐**：`WallpaperAodView.computeCenterCropSrc()` 按 LTR `0` / RTL `bw - cropW` 水平对齐「壁纸与个性化」起始框选区域；`AodController.loadBaseWallpaperScale()` 自动读取系统 `config_wallpaperMaxScale`（如 `1.1`）并与配置 `scale` 相乘（`scale=1.0` 时无缝匹配锁屏静态 `1.1x`），`ensureLockscreenCenterOffset()` 固定锁屏偏移为 LTR `0.0f` / RTL `1.0f` 并校验 `tok.isBinderAlive()`。
 
 ### 2. 姿态与智能感应
 - **反扣手机自动关闭所有 AOD（`flipOff`）**：当手机屏幕朝下水平反扣放置时，自动关闭全部 AOD（同时关闭全屏壁纸与系统时钟，进入 `DOZE_AOD_PAUSED` 彻底熄屏省电）；再次将手机翻转朝上时自动恢复显示 AOD。
@@ -37,7 +38,7 @@
 
 ## 📦 安装与使用
 
-1. 从 [Releases](../../releases) 下载最新 `FullAOD-v1.5-opt.apk`（或使用本地构建产物）并安装到手机。
+1. 从 [Releases](../../releases) 下载最新 `FullAOD-v1.6.apk`（或使用本地构建产物）并安装到手机。
 2. 打开 **LSPosed 管理器** → 启用 **FullAOD** 模块 → 勾选作用域 **`系统界面 (com.android.systemui)`**。
 3. 打开一次 **FullAOD** 应用（自动完成 `WRITE_SECURE_SETTINGS` 权限自愈并同步 19 项配置至 `Settings.Secure`）。
 4. 重启一次 SystemUI（`su -c "killall com.android.systemui"`）或重启手机即可生效；后续调整任何参数均在**下次熄屏时自动生效**，无需再次重启。
